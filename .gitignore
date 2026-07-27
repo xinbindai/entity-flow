@@ -1,0 +1,17 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Windows "downloaded from the internet" metadata streams, which surface as
+# real files under WSL
+*:Zone.Identifier
+
+# Local credentials -- copy .env.example to .env and fill it in
+.env

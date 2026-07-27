@@ -1,0 +1,144 @@
+"""
+Test data + database setup for the poll_and_dispatch tests.
+
+Everything is created inside a dedicated `poll_test` Postgres schema rather
+than `public`, so running these tests never touches anything else in the
+database and teardown is a single DROP SCHEMA ... CASCADE.
+
+Connection URL comes from entity-model/.env (POSTGRES_URL).
+"""
+
+from __future__ import annotations
+
+import sys
+import uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+ENTITY_MODEL = HERE.parent
+sys.path.insert(0, str(ENTITY_MODEL))
+
+from sqlalchemy import create_engine, text  # noqa: E402
+from sqlalchemy.orm import Session  # noqa: E402
+
+from models import Base, EventRecord, Task, seed_taxonomy  # noqa: E402
+
+TEST_SCHEMA = "poll_test"
+
+# occurred_at is business time with no server default, so producers always
+# supply it. Aware datetimes only -- the column is timestamptz.
+BASE_TIME = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+
+def load_env(path: Path | None = None) -> dict[str, str]:
+    """Minimal .env reader -- avoids a python-dotenv dependency."""
+    path = path or (ENTITY_MODEL / ".env")
+    if not path.exists():
+        raise SystemExit(
+            f"{path} not found. Copy {ENTITY_MODEL / '.env.example'} to .env "
+            f"and set POSTGRES_URL to a database you can create schemas in."
+        )
+    values: dict[str, str] = {}
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, _, value = line.partition("=")
+        values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
+
+
+def make_engine(echo: bool = False):
+    url = load_env()["POSTGRES_URL"]
+    # search_path pins every table, the trigger function and gen_random_uuid()
+    # lookups into the test schema.
+    return create_engine(
+        url,
+        echo=echo,
+        connect_args={"options": f"-csearch_path={TEST_SCHEMA},public"},
+    )
+
+
+def reset_schema(engine) -> None:
+    """Drop and recreate the test schema, then build the full model schema."""
+    with engine.begin() as conn:
+        conn.execute(text(f"DROP SCHEMA IF EXISTS {TEST_SCHEMA} CASCADE"))
+        conn.execute(text(f"CREATE SCHEMA {TEST_SCHEMA}"))
+    Base.metadata.create_all(engine)
+
+
+def drop_schema(engine) -> None:
+    with engine.begin() as conn:
+        conn.execute(text(f"DROP SCHEMA IF EXISTS {TEST_SCHEMA} CASCADE"))
+
+
+# --------------------------------------------------------------------------
+# Test data builders
+# --------------------------------------------------------------------------
+def fresh_session(engine) -> Session:
+    """A schema reset to empty, taxonomy seeded, ready for a test."""
+    reset_schema(engine)
+    session = Session(engine)
+    seed_taxonomy(session)
+    return session
+
+
+def make_task(session: Session, name: str = "pipeline-run-1") -> Task:
+    """One Running analysis task, the entity the test events hang off."""
+    task = Task(
+        subcategory="bioinformatics_pipeline_analysis",
+        name=name,
+        status="Running",
+        correlation_id=uuid.uuid4(),
+        attributes={"retry_count": 0},
+    )
+    session.add(task)
+    session.commit()
+    return task
+
+
+def make_event(
+    session: Session,
+    task: Task,
+    *,
+    event_type: str = "AnalysisTaskSucceeded",
+    seq: int = 0,
+    sample_id: str | None = None,
+    occurred_at: datetime | None = None,
+    commit: bool = True,
+) -> EventRecord:
+    """
+    One event, built directly rather than through fire_event() so tests can
+    control occurred_at and can create events that don't imply a valid status
+    transition on the task.
+
+    commit=False leaves the event in the open transaction, which is how the
+    timing tests observe several rows sharing one transaction.
+    """
+    ev = EventRecord(
+        event_type=event_type,
+        entity_type=task.category,
+        entity_id=task.id,
+        correlation_id=task.correlation_id,
+        source="pipeline-worker",
+        actor_type="worker",
+        payload={
+            "sequencing_sample_id": sample_id or f"SEQ-{seq:03d}",
+            "pipeline_version": "v2.3.1",
+            "reference_genome": "GRCh38",
+            "seq": seq,
+        },
+        occurred_at=occurred_at or (BASE_TIME + timedelta(seconds=seq)),
+    )
+    session.add(ev)
+    if commit:
+        session.commit()
+    else:
+        session.flush()
+    return ev
+
+
+def make_event_series(session: Session, task: Task, count: int) -> list[EventRecord]:
+    """`count` AnalysisTaskSucceeded events with strictly increasing occurred_at."""
+    return [make_event(session, task, seq=i) for i in range(count)]
