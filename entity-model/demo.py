@@ -1,13 +1,16 @@
 """
-Demo: firing an event atomically with an entity transition (the
-transactional outbox pattern / "Transaction 1"), and a poll-based consumer
-that dispatches unprocessed events to a handler with per-handler
-idempotency via event_handler_checkpoints ("Transaction 2").
+Worked example of the entity-event-task model: firing an event atomically
+with an entity transition (the transactional outbox pattern / "Transaction
+1"), and a poll-based consumer that dispatches unprocessed events to a
+handler with per-handler idempotency via event_handler_checkpoints
+("Transaction 2").
 
-Verified logic (fire_event / poll_and_dispatch / checkpoint idempotency /
-causation_id chaining) against an in-memory database before shipping this
-file; run it for real against Postgres, since models.py uses JSONB,
-gen_random_uuid(), and a PL/pgSQL trigger that only exist there:
+The reusable pieces -- fire_event, the handler registry and the dispatch
+loop -- live in outbox.py. What's left here is domain-specific: one handler,
+its subscription, and a scripted walkthrough.
+
+Run it against Postgres; models.py uses JSONB, gen_random_uuid() and a
+PL/pgSQL trigger that only exist there:
 
     pip install "sqlalchemy>=2.0" psycopg2-binary
     python demo.py postgresql+psycopg2://localhost/lab_platform_demo
@@ -17,119 +20,27 @@ from __future__ import annotations
 
 import sys
 import uuid
-from collections.abc import Callable
-from datetime import datetime, timezone
 
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
-from models import Base, EventHandlerCheckpoint, EventRecord, Result, Task, seed_taxonomy
+from models import Base, EventRecord, Result, Task
+from taxonomy import seed_taxonomy
+from outbox import HandlerRegistry, dispatch_once, fire_event
 
 
 # --------------------------------------------------------------------------
-# Producer side: entity transition + its own event, one transaction --
-# "Transaction 1" from the design discussion. Doesn't commit itself, so it
-# composes with whatever else the caller needs in the same transaction.
+# The subscriptions this process runs. A second handler on the same event
+# type would be another @registry.on below and nothing else -- no change to
+# the producer, no change to this handler.
 # --------------------------------------------------------------------------
-def fire_event(
-    session: Session,
-    entity,
-    *,
-    event_type: str,
-    new_status: str,
-    payload: dict,
-    source: str,
-    actor_type: str,
-    actor_id: str | None = None,
-    causation_type: str | None = None,
-    causation_id: uuid.UUID | None = None,
-    occurred_at: datetime | None = None,
-) -> EventRecord:
-    """
-    occurred_at is business time -- when the fact actually happened. Pass it
-    whenever the producer knows it (a pipeline that finished at 10:00:00 but
-    commits at 10:00:04 must record 10:00:00). The fallback is the moment this
-    event was constructed, which is still far closer than a server-side now(),
-    since now() is transaction start time.
-
-    recorded_at is left to the database (clock_timestamp()). Note that even
-    that is insert time, not commit time: a transaction can insert at T and
-    commit at T+30s, and rows only become visible at commit. So don't use
-    either timestamp as a consumption cursor -- drain on published_at IS NULL
-    with FOR UPDATE SKIP LOCKED instead.
-    """
-    entity.status = new_status
-    ev = EventRecord(
-        event_type=event_type,
-        entity_type=entity.category,
-        entity_id=entity.id,
-        correlation_id=entity.correlation_id or uuid.uuid4(),
-        causation_type=causation_type,
-        causation_id=causation_id,
-        source=source,
-        actor_type=actor_type,
-        actor_id=actor_id,
-        payload=payload,
-        occurred_at=occurred_at or datetime.now(timezone.utc),
-    )
-    session.add(ev)
-    return ev
+registry = HandlerRegistry()
 
 
-# --------------------------------------------------------------------------
-# Consumer side: poll for events this handler hasn't processed yet (no
-# checkpoint row for this handler), dispatch each one, commit the handler's
-# writes together with its own checkpoint row.
-#
-# NOT EXISTS rather than NOT IN: Postgres won't rewrite `NOT IN (subquery)`
-# as an anti-join -- NULL semantics block it even though event_id is NOT
-# NULL -- so it hashes every checkpoint row for this handler on each poll,
-# and degrades to a per-row rescan once that exceeds work_mem. Correlated
-# NOT EXISTS plans as a real anti-join against the (handler_name, event_id)
-# primary key instead.
-#
-# The batch_size limit caps how much one poll pulls into memory. Note that
-# this still scans all history for these event types to find the new rows;
-# bounding that needs a watermark or a claim-based drain (see the
-# published_at/publish_attempts columns on EventRecord).
-# --------------------------------------------------------------------------
-def poll_and_dispatch(
-    session: Session,
-    *,
-    handler_name: str,
-    event_types: list[str],
-    handle: Callable[[Session, EventRecord], None],
-    batch_size: int = 100,
-) -> int:
-    already_processed = (
-        select(EventHandlerCheckpoint.event_id)
-        .where(
-            EventHandlerCheckpoint.handler_name == handler_name,
-            EventHandlerCheckpoint.event_id == EventRecord.event_id,
-        )
-        .exists()
-    )
-    pending = session.scalars(
-        select(EventRecord)
-        .where(EventRecord.event_type.in_(event_types))
-        .where(~already_processed)
-        .order_by(EventRecord.occurred_at)
-        .limit(batch_size)
-    ).all()
-
-    for ev in pending:
-        handle(session, ev)
-        session.add(EventHandlerCheckpoint(handler_name=handler_name, event_id=ev.event_id))
-        session.commit()  # "Transaction 2": handler's entity writes + its checkpoint, atomically
-
-    return len(pending)
-
-
-# --------------------------------------------------------------------------
-# The actual handler: on AnalysisTaskSucceeded, create the Sample Result
-# and emit the event that describes it -- same "create-sample-result"
-# handler discussed throughout the design conversation.
-# --------------------------------------------------------------------------
+# The actual handler: on AnalysisTaskSucceeded, create the Sample Result and
+# emit the event that describes it -- same "create-sample-result" handler
+# discussed throughout the design conversation.
+@registry.on("AnalysisTaskSucceeded", name="create-sample-result-on-analysis-succeeded")
 def create_sample_result_on_analysis_succeeded(session: Session, ev: EventRecord) -> None:
     result = Result(
         category="Result",
@@ -196,22 +107,15 @@ def main(db_url: str) -> None:
         )
         session.commit()  # Transaction 1: task.status + AnalysisTaskSucceeded event, together
 
+        # dispatch_once is one pass over every registered handler. A real
+        # worker calls listen(session_factory, registry) instead, which is
+        # this in a loop; the demo steps it manually to show idempotency.
         print("\nConsumer: first poll")
-        n = poll_and_dispatch(
-            session,
-            handler_name="create-sample-result-on-analysis-succeeded",
-            event_types=["AnalysisTaskSucceeded"],
-            handle=create_sample_result_on_analysis_succeeded,
-        )
+        n = dispatch_once(session, registry)
         print(f"  processed {n} event(s)")
 
         print("\nConsumer: second poll (idempotency check)")
-        n = poll_and_dispatch(
-            session,
-            handler_name="create-sample-result-on-analysis-succeeded",
-            event_types=["AnalysisTaskSucceeded"],
-            handle=create_sample_result_on_analysis_succeeded,
-        )
+        n = dispatch_once(session, registry)
         print(f"  processed {n} event(s) -- already-handled event correctly skipped")
 
         print("\nEvent log:")

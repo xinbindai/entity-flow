@@ -1,6 +1,7 @@
 """
-Tests for demo.poll_and_dispatch against a real Postgres (JSONB, the
-PL/pgSQL status trigger and gen_random_uuid() rule out SQLite).
+Tests for outbox.poll_and_dispatch against a real Postgres (JSONB, the
+PL/pgSQL status trigger and gen_random_uuid() rule out SQLite). The handler
+it dispatches to comes from demo.py, since that part is domain-specific.
 
 Plain asserts and a tiny runner, so this needs nothing beyond the project's
 existing sqlalchemy + psycopg2 -- but the test functions are pytest-shaped,
@@ -27,7 +28,8 @@ from testdata import (  # noqa: E402
     make_task,
 )
 
-from demo import create_sample_result_on_analysis_succeeded, poll_and_dispatch  # noqa: E402
+from demo import create_sample_result_on_analysis_succeeded  # noqa: E402
+from outbox import poll_and_dispatch  # noqa: E402
 from models import EventHandlerCheckpoint, EventRecord, Result  # noqa: E402
 
 HANDLER = "create-sample-result-on-analysis-succeeded"

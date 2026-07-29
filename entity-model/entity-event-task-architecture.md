@@ -86,7 +86,7 @@ erDiagram
 
 ### 2.4 Implementation: the unified entity table
 
-Two ways to physically implement §2.1–§2.3 were worked through. **The unified polymorphic table is the chosen design** — it is what `entity_schema_unified.sql`, `models.py` and `demo.py` implement, and the only entity schema in this repository. The alternative is recorded at the end of this section because the trade-off it lost on is worth understanding, not because it remains open.
+Two ways to physically implement §2.1–§2.3 were worked through. **The unified polymorphic table is the chosen design** — it is what `entity_schema_unified.sql`, `models.py`, `outbox.py` and `demo.py` implement, and the only entity schema in this repository. The alternative is recorded at the end of this section because the trade-off it lost on is worth understanding, not because it remains open.
 
 A single `entity` table for every entity type, with:
 
@@ -247,6 +247,16 @@ Whenever *any* of the three above needs to change an entity's state, it does so 
 
 Multiple independent handlers can subscribe to the same event without knowing about each other — that's the actual mechanism `entity_relationship`/events buys you: adding a new reaction to `AnalysisTaskSucceeded` never touches the code that produces it or any other handler already subscribed. Idempotency is tracked per handler, not globally on the event, via a composite-keyed checkpoint table (`handler_name`, `event_id`) — critical, because a single `processed` flag on the event itself would let the first handler's completion silently block every other handler from ever running.
 
+Failure is tracked the same way and in the same shape, in a second composite-keyed table `event_handler_failures` (`handler_name`, `event_id`, `attempts`, `last_error`, `next_attempt_at`). A handler that raises doesn't abort the rest of the batch — the failure is recorded against that one event and the consumer moves on, so a single poison event can't stall the queue. After `max_attempts` consecutive failures the event is **dead-lettered**: normal polling stops offering it, and recovering it takes an explicit `replay()` once whatever broke is fixed. A success deletes the failure row, so `attempts` always counts consecutive failures rather than lifetime ones.
+
+Between attempts the event is held back by an exponential backoff — `backoff_seconds * 2**(attempts-1)`, capped — stored as a `next_attempt_at` deadline. Without it a failing event is re-offered on every poll, so a one-second poll loop would exhaust a five-attempt budget in five seconds and record five identical errors, which defeats the point of retrying at all. The deadline is computed server-side from the stored counter so it never depends on a worker's clock. Note the asymmetry: `max_attempts` is compared against the counter at selection time, so raising it re-offers dead letters immediately, whereas the backoff is baked into `next_attempt_at` when the failure is recorded and so only affects subsequent failures.
+
+The eligibility check uses `statement_timestamp()` rather than `now()` or `clock_timestamp()`, and the choice is load-bearing. `now()` is transaction-start time, and a poll that dispatches nothing leaves its transaction open — a long-lived consumer session would keep comparing against a stale "now" and never release a backed-off event. `clock_timestamp()` advances correctly but is `VOLATILE`, which stops the planner flattening the subquery and drops it to a per-row `SubPlan`. `statement_timestamp()` is `STABLE` (so the anti-join survives) and still advances on every statement (so events are released on time).
+
+Handlers are declared through a `HandlerRegistry` — each subscription is a `(name, event_types, handler)` triple plus its own retry settings. The registry rejects a duplicate name outright, because the name *is* the `handler_name` written to the checkpoint table: two handlers sharing one would share a ledger and each would mark the other's events processed. For the same reason the name is required rather than derived from the function, since deriving it would turn an ordinary Python rename into a silent replay of the entire event history under a new identity. `dispatch_once()` makes one pass over every registration and `listen()` is that in a loop — draining at full speed while there is work, sleeping `poll_interval` when idle, and opening a fresh session per cycle so a long-running worker never sits idle-in-transaction pinning an old snapshot.
+
+Keeping failures in their own table rather than adding a status column to the checkpoint ledger is deliberate: "a checkpoint row exists" has to keep meaning exactly one thing — this handler processed this event successfully — because both the consumer's anti-join and `replay()` rest on it.
+
 ### 5.4 The loop
 
 ```mermaid
@@ -280,13 +290,18 @@ This design was carried through to working code, produced alongside this documen
 | File | Contents |
 |---|---|
 | `entity_schema_unified.sql` | The entity schema (§2.4) — taxonomy, status trigger, relationship graph |
-| `events_schema.sql` | The event log/outbox table (§3.1) and per-handler checkpoint table (§5.3) |
-| `models.py` | SQLAlchemy 2.0 ORM models for the unified schema, including polymorphic `Task`/`Patient`/`Sample`/etc. subclasses of `Entity`, and the DDL wiring for the status-validation trigger |
-| `demo.py` | Runnable demonstration of `fire_event()` (the transactional-outbox write) and `poll_and_dispatch()` (the checkpointed consumer), taking a task from `Succeeded` through to a created `SampleResult`, with a second poll showing idempotent no-op behavior |
+| `events_schema.sql` | The event log/outbox table (§3.1), the per-handler checkpoint table and the retry/dead-letter table (§5.3) |
+| `models.py` | SQLAlchemy 2.0 ORM models for the unified schema, including polymorphic `Task`/`Patient`/`Sample`/etc. subclasses of `Entity`, and the DDL wiring for the status-validation trigger. Schema only — no domain data, so a different deployment can use it verbatim |
+| `taxonomy.py` | This lab's `entity_type` / `entity_status` rows and `seed_taxonomy()`. Domain configuration rather than schema, and required before any entity can be inserted; `python taxonomy.py <url>` bootstraps a dev database |
+| `outbox.py` | The reusable primitives, domain-independent: `fire_event()` (the transactional-outbox write, §4.1), `poll_and_dispatch()` (the checkpointed consumer, with retry limiting and exponential backoff, §5.3), `replay()` (targeted re-dispatch of specific events to one handler), `dead_lettered()` (events a handler has given up on), and the worker layer on top: `HandlerRegistry` / `dispatch_once()` / `listen()` |
+| `demo.py` | Runnable walkthrough built on `outbox.py`, plus the domain-specific `create-sample-result` handler and its registry subscription: takes a task from `Succeeded` through to a created `SampleResult`, with a second poll showing idempotent no-op behavior |
 | `test/testdata.py` | Test data builders plus schema setup/teardown, isolated in a dedicated `poll_test` Postgres schema; reads `POSTGRES_URL` from `.env` |
 | `test/test_poll_and_dispatch.py` | Consumer tests (§5.3): dispatch, per-handler idempotency, independent handler progress, event-type filtering, batching and order, and an assertion that the polling query plans as an anti-join |
 | `test/test_event_timing.py` | Timing-column tests (§3.1): `occurred_at` as producer-supplied business time, `recorded_at` as database write time distinct within one transaction, and the relay's `published_at` / `publish_attempts` update |
 | `test/test_entity_subclasses.py` | Polymorphic subclass and taxonomy tests (§2.4): `Client`/`Patient` round-tripping to the right class, discriminator filtering, status-trigger rejection, and a check that no subcategory is left with zero valid statuses |
+| `test/test_dispatch_retry.py` | Retry, backoff and dead-letter tests (§5.3): a failing handler not aborting the batch, attempts accumulating across polls, exponential backoff holding an event until its deadline and releasing it after, the backoff cap, dead-lettering at the limit, per-handler isolation, success clearing failure history, and replay as the recovery path |
+| `test/test_registry.py` | Registry and worker-loop tests (§5.3): registration validation, duplicate-name rejection, per-handler routing and settings, one failing handler not stopping the others, and `listen()` draining, idling, picking up events committed between cycles, and shutting down on its stop event |
+| `test/test_replay.py` | Replay tests: re-dispatch of processed events, checkpoint upsert rather than duplication, isolation from other handlers, and the guarantee that a failed replay leaves the original checkpoint intact so normal polling isn't poisoned |
 
 ## 8. Summary of key principles
 

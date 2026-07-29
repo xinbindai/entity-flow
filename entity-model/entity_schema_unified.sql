@@ -135,8 +135,11 @@ CREATE TABLE entity (
                                          -- null for fan-in entities (illumina_run) and joint results/tasks --
                                          -- their lineage lives in entity_relationship instead
     attributes      JSONB NOT NULL DEFAULT '{}',
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- clock_timestamp(), not now(): now() is transaction start time, so a
+    -- batch of entities created in one transaction would share a created_at,
+    -- and a row updated twice in one transaction would show no change.
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     FOREIGN KEY (category, subcategory) REFERENCES entity_type (category, subcategory)
 );
 
@@ -158,7 +161,7 @@ BEGIN
     ) THEN
         RAISE EXCEPTION 'invalid status % for %/%', NEW.status, NEW.category, NEW.subcategory;
     END IF;
-    NEW.updated_at := now();
+    NEW.updated_at := clock_timestamp();
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
@@ -181,7 +184,7 @@ CREATE TABLE entity_relationship (
     child_entity_id    UUID NOT NULL REFERENCES entity(id),
     relationship_type  TEXT NOT NULL,   -- 'has_order' | 'has_sample' | 'prepped_into' | 'pooled_into' |
                                           -- 'analyzed_by' | 'produced' | 'archived_from' | ...
-    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     UNIQUE (parent_entity_id, child_entity_id, relationship_type)
 );
 

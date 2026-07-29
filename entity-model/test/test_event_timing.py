@@ -1,7 +1,17 @@
 """
-Tests for EventRecord's timing columns: occurred_at (business time, supplied
-by the producer), recorded_at (system time, supplied by the database) and
-published_at (set by the outbox relay).
+Tests for the model's timing columns.
+
+EventRecord: occurred_at (business time, supplied by the producer),
+recorded_at (system time, supplied by the database) and published_at (set by
+the outbox relay).
+
+Entity: created_at and updated_at, the latter written by the
+validate_entity_status trigger on every INSERT and UPDATE.
+
+The recurring theme is now() vs clock_timestamp(). now() is transaction start
+time, so anything defaulted from it collapses every row written in one
+transaction to a single value -- which silently breaks "when did this change"
+for both tables.
 
     python test/test_event_timing.py
 """
@@ -26,8 +36,8 @@ from testdata import (  # noqa: E402
     make_task,
 )
 
-from demo import fire_event  # noqa: E402
-from models import EventRecord  # noqa: E402
+from outbox import fire_event  # noqa: E402
+from models import EventRecord, Task  # noqa: E402
 
 
 def test_occurred_at_is_required(session: Session) -> None:
@@ -192,6 +202,97 @@ def test_unpublished_partial_index_exists(session: Session) -> None:
 
 
 # --------------------------------------------------------------------------
+# Entity.created_at / updated_at
+# --------------------------------------------------------------------------
+def test_entity_timestamps_are_timezone_aware(session: Session) -> None:
+    task = make_task(session)
+    session.refresh(task)
+
+    assert task.created_at.tzinfo is not None, "created_at came back naive"
+    assert task.updated_at.tzinfo is not None, "updated_at came back naive"
+    assert task.created_at.utcoffset() == timedelta(0), task.created_at
+
+
+def test_updated_at_is_at_least_created_at_on_insert(session: Session) -> None:
+    """The BEFORE INSERT trigger runs after column defaults are applied, so
+    updated_at is stamped fractionally later than created_at, never before."""
+    task = make_task(session)
+    session.refresh(task)
+
+    assert task.updated_at >= task.created_at, (task.created_at, task.updated_at)
+
+
+def test_update_advances_updated_at_but_not_created_at(session: Session) -> None:
+    task = make_task(session)
+    session.refresh(task)
+    created, first_update = task.created_at, task.updated_at
+
+    task.status = "Retrying"
+    session.commit()
+    session.refresh(task)
+
+    assert task.created_at == created, "created_at must not move on update"
+    assert task.updated_at > first_update, "trigger did not advance updated_at"
+
+
+def test_two_updates_in_one_transaction_get_distinct_updated_at(session: Session) -> None:
+    """The point of clock_timestamp() in the trigger: with now() both updates
+    would land on transaction start time and the second would be invisible to
+    anything polling "changed since X"."""
+    task = make_task(session)
+
+    task.status = "Retrying"
+    session.flush()
+    session.refresh(task)
+    first = task.updated_at
+
+    session.execute(text("SELECT pg_sleep(0.01)"))
+    task.status = "Running"
+    session.flush()
+    session.refresh(task)
+    second = task.updated_at
+
+    frozen = {session.scalar(select(func.now())) for _ in range(2)}
+    session.commit()
+
+    assert second > first, f"updated_at did not advance within a transaction: {first} -> {second}"
+    assert len(frozen) == 1, "now() should be frozen for the transaction"
+
+
+def test_entities_created_in_one_transaction_get_distinct_created_at(session: Session) -> None:
+    task_a = Task(subcategory="bioinformatics_pipeline_analysis", name="a",
+                  status="Queued", attributes={})
+    session.add(task_a)
+    session.flush()
+    session.execute(text("SELECT pg_sleep(0.01)"))
+
+    task_b = Task(subcategory="bioinformatics_pipeline_analysis", name="b",
+                  status="Queued", attributes={})
+    session.add(task_b)
+    session.flush()
+    session.commit()
+
+    session.refresh(task_a)
+    session.refresh(task_b)
+    assert task_a.created_at != task_b.created_at, "created_at collapsed within a transaction"
+    assert task_a.created_at < task_b.created_at
+
+
+def test_updated_at_cannot_be_set_by_the_application(session: Session) -> None:
+    """The trigger owns the column, so a client-supplied value is overwritten
+    rather than trusted."""
+    task = make_task(session)
+    stale = datetime(2000, 1, 1, tzinfo=timezone.utc)
+
+    task.updated_at = stale
+    task.status = "Retrying"
+    session.commit()
+    session.refresh(task)
+
+    assert task.updated_at > stale, "application-supplied updated_at was trusted"
+
+
+# --------------------------------------------------------------------------
 TESTS = [
     test_occurred_at_is_required,
     test_timestamps_are_timezone_aware,
@@ -200,6 +301,12 @@ TESTS = [
     test_recorded_at_differs_within_one_transaction,
     test_published_at_starts_null_and_relay_sets_it,
     test_publish_attempts_has_a_server_default,
+    test_entity_timestamps_are_timezone_aware,
+    test_updated_at_is_at_least_created_at_on_insert,
+    test_update_advances_updated_at_but_not_created_at,
+    test_two_updates_in_one_transaction_get_distinct_updated_at,
+    test_entities_created_in_one_transaction_get_distinct_created_at,
+    test_updated_at_cannot_be_set_by_the_application,
     test_unpublished_partial_index_exists,
 ]
 

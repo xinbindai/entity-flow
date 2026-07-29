@@ -17,9 +17,15 @@ could not:
    just another `category` row in entity_type -- confirming in code what
    was established in discussion: a task is an entity.
 
+This module is schema only -- table definitions and the DDL hook for the
+status trigger, nothing domain-specific. Which (category, subcategory) pairs
+exist and which statuses each may hold lives in taxonomy.py, so a different
+deployment can keep this file verbatim and replace that one.
+
 For ongoing schema changes, pair this with Alembic rather than relying on
 create_all() in production -- create_all()/the DDL hooks below are meant
-for bootstrapping a dev/test database in one call.
+for bootstrapping a dev/test database in one call (see taxonomy.py's
+__main__ for that).
 """
 
 from __future__ import annotations
@@ -42,7 +48,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.schema import DDL
 
 
@@ -103,8 +109,19 @@ class Entity(Base):
     status: Mapped[str] = mapped_column(String, nullable=False)
     correlation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), index=True)
     attributes: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    # timestamptz, matching entity_schema_unified.sql, and clock_timestamp()
+    # rather than now(): now() is transaction start time, so a batch of
+    # entities created in one transaction would all share a created_at, and
+    # an entity updated twice in one transaction would show no change at all.
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.clock_timestamp()
+    )
+    # Written by the validate_entity_status trigger on every INSERT and
+    # UPDATE, so the application can't set it or forget to. The server_default
+    # only ever applies if that trigger is missing.
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.clock_timestamp()
+    )
 
     __mapper_args__ = {
         "polymorphic_on": category,
@@ -133,7 +150,11 @@ _validate_status_function = DDL(
             -- TypeError before the statement ever reaches the server.
             RAISE EXCEPTION 'invalid status %% for %%/%%', NEW.status, NEW.category, NEW.subcategory;
         END IF;
-        NEW.updated_at := now();
+        -- clock_timestamp(), not now(): now() is transaction start time, so
+        -- two updates to the same row in one transaction would leave
+        -- updated_at unchanged, and anything polling "changed since X" would
+        -- miss the second one.
+        NEW.updated_at := clock_timestamp();
         RETURN NEW;
     END;
     $$ LANGUAGE plpgsql;
@@ -251,7 +272,9 @@ class EntityRelationship(Base):
     parent_entity_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("entity.id"), index=True)
     child_entity_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("entity.id"), index=True)
     relationship_type: Mapped[str] = mapped_column(String, nullable=False, index=True)
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.clock_timestamp()
+    )
 
     parent: Mapped[Entity] = relationship(foreign_keys=[parent_entity_id])
     child: Mapped[Entity] = relationship(foreign_keys=[child_entity_id])
@@ -340,81 +363,43 @@ class EventHandlerCheckpoint(Base):
 
     handler_name: Mapped[str] = mapped_column(String, primary_key=True)
     event_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("events.event_id"), primary_key=True)
-    processed_at: Mapped[datetime] = mapped_column(server_default=func.now())
-
-
-# --------------------------------------------------------------------------
-# Taxonomy seed data -- mirrors the INSERT statements in
-# entity_schema_unified.sql. Call once against a fresh database.
-# --------------------------------------------------------------------------
-def seed_taxonomy(session: Session) -> None:
-    types = [
-        EntityType(category="Client", subcategory="ordering_institution", description="Ordering institution or practice that submits lab orders"),
-        EntityType(category="Patient", subcategory="patient", description="Root clinical identity"),
-        EntityType(category="Order", subcategory="lab_order", description="Test requisition"),
-        EntityType(category="Sample", subcategory="raw_specimen", description="Physical specimen as collected"),
-        EntityType(category="Sample", subcategory="library_sample", description="Prepped library/aliquot ready for sequencing"),
-        EntityType(category="Batch", subcategory="illumina_run", description="A sequencing run pooling many library samples"),
-        EntityType(category="Result", subcategory="sample_result", description="Pipeline output for one or more library samples"),
-        EntityType(category="Task", subcategory="bioinformatics_pipeline_analysis", description="Async pipeline execution task"),
-        EntityType(category="Task", subcategory="data_archiving", description="Async data archival task"),
-    ]
-
-    # Every subcategory in `types` needs at least one row here: the
-    # validate_entity_status trigger rejects any status without a matching
-    # (category, subcategory, status) row, so a subcategory with none is
-    # impossible to insert at all.
-    statuses = [
-        ("Client", "ordering_institution", "Onboarding", False),
-        ("Client", "ordering_institution", "Active", False),
-        ("Client", "ordering_institution", "Suspended", False),
-        ("Client", "ordering_institution", "Offboarded", True),
-        ("Patient", "patient", "Active", False), ("Patient", "patient", "Inactive", False),
-        ("Patient", "patient", "Deceased", True), ("Patient", "patient", "Merged", True),
-        ("Order", "lab_order", "Placed", False), ("Order", "lab_order", "InProgress", False),
-        ("Order", "lab_order", "Completed", True), ("Order", "lab_order", "Cancelled", True),
-        ("Sample", "raw_specimen", "Received", False), ("Sample", "raw_specimen", "Accessioned", False),
-        ("Sample", "raw_specimen", "QC_Passed", False), ("Sample", "raw_specimen", "Rejected", True),
-        ("Sample", "raw_specimen", "Consumed", True),
-        ("Sample", "library_sample", "Prepped", False), ("Sample", "library_sample", "Loaded", False),
-        ("Sample", "library_sample", "Sequencing", False), ("Sample", "library_sample", "Sequenced", True),
-        ("Sample", "library_sample", "Failed", True),
-        ("Batch", "illumina_run", "Planned", False), ("Batch", "illumina_run", "Loading", False),
-        ("Batch", "illumina_run", "Running", False), ("Batch", "illumina_run", "Complete", True),
-        ("Batch", "illumina_run", "Failed", True),
-        ("Result", "sample_result", "Pending", False), ("Result", "sample_result", "Processing", False),
-        ("Result", "sample_result", "Complete", False), ("Result", "sample_result", "Reviewed", False),
-        ("Result", "sample_result", "Released", False), ("Result", "sample_result", "Archived", True),
-        ("Result", "sample_result", "Failed", True),
-        ("Task", "bioinformatics_pipeline_analysis", "Queued", False),
-        ("Task", "bioinformatics_pipeline_analysis", "Running", False),
-        ("Task", "bioinformatics_pipeline_analysis", "Succeeded", True),
-        ("Task", "bioinformatics_pipeline_analysis", "Failed", True),
-        ("Task", "bioinformatics_pipeline_analysis", "Retrying", False),
-        ("Task", "bioinformatics_pipeline_analysis", "Cancelled", True),
-        ("Task", "data_archiving", "Queued", False), ("Task", "data_archiving", "Running", False),
-        ("Task", "data_archiving", "Succeeded", True), ("Task", "data_archiving", "Failed", True),
-        ("Task", "data_archiving", "Retrying", False), ("Task", "data_archiving", "Cancelled", True),
-    ]
-
-    session.add_all(types)
-    # Flush the parent rows before adding the children: the entity_type ->
-    # entity_status dependency is a table-level ForeignKeyConstraint with no
-    # ORM relationship() behind it, so the unit of work has nothing to sort
-    # these two INSERT batches by and may emit entity_status first.
-    session.flush()
-    session.add_all(
-        EntityStatus(category=c, subcategory=s, status=st, is_terminal=t) for c, s, st, t in statuses
+    processed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.clock_timestamp()
     )
-    session.commit()
 
 
-if __name__ == "__main__":
-    # Minimal bootstrap example for a dev/test database:
-    #   pip install "sqlalchemy>=2.0" psycopg2-binary
-    from sqlalchemy import create_engine
+class EventHandlerFailure(Base):
+    """Per-handler retry bookkeeping -- the counterpart to
+    EventHandlerCheckpoint. A checkpoint row means "this handler processed
+    this event successfully"; a failure row means "it tried and raised".
 
-    engine = create_engine("postgresql+psycopg2://localhost/lab_platform")
-    Base.metadata.create_all(engine)
-    with Session(engine) as session:
-        seed_taxonomy(session)
+    Deliberately a separate table rather than a status column on the
+    checkpoint ledger: "a checkpoint exists" has to keep meaning exactly one
+    thing, since both poll_and_dispatch's anti-join and replay() rest on it.
+
+    The row is deleted once the handler eventually succeeds, so `attempts`
+    always counts *consecutive* failures. An event whose attempts reach the
+    caller's max_attempts is dead-lettered: poll_and_dispatch stops selecting
+    it, and it takes an explicit replay() to try again.
+    """
+
+    __tablename__ = "event_handler_failures"
+
+    handler_name: Mapped[str] = mapped_column(String, primary_key=True)
+    event_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("events.event_id"), primary_key=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    first_failed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.clock_timestamp()
+    )
+    last_failed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.clock_timestamp()
+    )
+    # Earliest time this handler should be offered the event again. Without
+    # it a failing event is retried on every poll, so a 1s poll loop would
+    # burn the whole attempt budget in seconds and record five near-identical
+    # errors. Computed server-side at failure time as an exponential backoff
+    # from `attempts`, so it never depends on a worker's clock.
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.clock_timestamp(), index=True
+    )

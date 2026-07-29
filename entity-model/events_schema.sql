@@ -74,6 +74,31 @@ CREATE INDEX idx_events_unpublished     ON events (published_at) WHERE published
 CREATE TABLE event_handler_checkpoints (
     handler_name     TEXT NOT NULL,               -- e.g. 'create-pipeline-task-on-sequencing-ready'
     event_id         UUID NOT NULL REFERENCES events(event_id),
-    processed_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    processed_at     TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (handler_name, event_id)
 );
+
+-- Retry bookkeeping, the counterpart to the ledger above: a checkpoint row
+-- means a handler succeeded on that event, a row here means it raised. Kept
+-- separate rather than adding a status column, so that "a checkpoint exists"
+-- keeps meaning exactly one thing.
+--
+-- The row is deleted once the handler eventually succeeds, so attempts counts
+-- consecutive failures. Once attempts reaches the consumer's max_attempts the
+-- event is dead-lettered: normal polling skips it and recovering it takes an
+-- explicit replay.
+-- next_attempt_at holds a failed event back until its backoff has elapsed.
+-- Without it a failing event is retried on every poll, so a 1s poll loop
+-- would burn the whole attempt budget in seconds. Computed server-side as an
+-- exponential backoff from attempts, so it never depends on a worker's clock.
+CREATE TABLE event_handler_failures (
+    handler_name     TEXT NOT NULL,
+    event_id         UUID NOT NULL REFERENCES events(event_id),
+    attempts         INT NOT NULL DEFAULT 0,
+    last_error       TEXT,
+    first_failed_at  TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    last_failed_at   TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    next_attempt_at  TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (handler_name, event_id)
+);
+CREATE INDEX idx_handler_failures_next_attempt ON event_handler_failures (next_attempt_at);

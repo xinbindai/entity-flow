@@ -1,5 +1,5 @@
 """
-Test data + database setup for the poll_and_dispatch tests.
+Test data + database setup shared by every suite in this directory.
 
 Everything is created inside a dedicated `poll_test` Postgres schema rather
 than `public`, so running these tests never touches anything else in the
@@ -22,7 +22,8 @@ sys.path.insert(0, str(ENTITY_MODEL))
 from sqlalchemy import create_engine, text  # noqa: E402
 from sqlalchemy.orm import Session  # noqa: E402
 
-from models import Base, EventRecord, Task, seed_taxonomy  # noqa: E402
+from models import Base, EventRecord, Task  # noqa: E402
+from taxonomy import seed_taxonomy  # noqa: E402
 
 TEST_SCHEMA = "poll_test"
 
