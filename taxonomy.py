@@ -1,112 +1,91 @@
 """
-The lab's entity taxonomy: which (category, subcategory) pairs exist and what
-statuses each one may hold. Mirrors the INSERT statements in
-entitymodel/entity_schema_unified.sql -- keep the two in step.
+This lab's entity taxonomy: which (category, subcategory) pairs exist and what
+statuses each may hold.
 
-This is domain configuration, not schema, which is why it lives here rather
-than in entitymodel/models.py: models.py defines the shape of any entity-event-task
-system, while this file says what *this* lab's entities are. A different
-deployment keeps models.py verbatim and replaces this file.
+The data lives in entity_types.csv and entity_statuses.csv beside this file,
+so it can be edited without touching Python, and the reconciliation logic
+lives in entitymodel.taxonomy_sync, so it is reusable by any deployment. What
+remains here is only the pointer from one to the other. Those two CSVs are the
+single copy of the taxonomy -- entity_schema_unified.sql defines the tables
+but deliberately does not list their rows.
 
-It is also not test or demo data -- a real deployment has to seed these rows
+This is domain configuration, not schema, which is why it sits at the repo
+root rather than inside the entitymodel package: models.py defines the shape
+of any entity-event-task system, these files say what *this* lab's entities
+are. A different deployment keeps the package and replaces these.
+
+It is also not test or demo data -- a real deployment must seed these rows
 before it can insert a single entity, because the validate_entity_status
 trigger rejects any status with no matching entity_status row.
 
-Bootstrap a dev/test database (create_all + seed) in one call:
-
-    python taxonomy.py postgresql+psycopg2://localhost/lab_platform
+    python taxonomy.py postgresql+psycopg2://localhost/lab            # create + seed
+    python taxonomy.py postgresql+psycopg2://localhost/lab --sync     # reconcile only
+    python taxonomy.py postgresql+psycopg2://localhost/lab --dry-run  # show the diff
 """
 
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 from sqlalchemy.orm import Session
 
-from entitymodel.models import EntityStatus, EntityType
+from entitymodel.taxonomy_sync import TaxonomyDiff, sync_taxonomy_from_csv
 
-# (category, subcategory, description)
-ENTITY_TYPES = [
-    ("Client", "ordering_institution", "Ordering institution or practice that submits lab orders"),
-    ("Patient", "patient", "Root clinical identity"),
-    ("Order", "lab_order", "Test requisition"),
-    ("Sample", "raw_specimen", "Physical specimen as collected"),
-    ("Sample", "library_sample", "Prepped library/aliquot ready for sequencing"),
-    ("Batch", "illumina_run", "A sequencing run pooling many library samples"),
-    ("Result", "sample_result", "Pipeline output for one or more library samples"),
-    ("Task", "bioinformatics_pipeline_analysis", "Async pipeline execution task"),
-    ("Task", "data_archiving", "Async data archival task"),
-]
+HERE = Path(__file__).resolve().parent
+ENTITY_TYPES_CSV = HERE / "entity_types.csv"
+ENTITY_STATUSES_CSV = HERE / "entity_statuses.csv"
 
-# (category, subcategory, status, is_terminal)
-#
-# Every subcategory in ENTITY_TYPES needs at least one row here: the
-# validate_entity_status trigger rejects any status without a matching
-# (category, subcategory, status) row, so a subcategory with none is
-# impossible to insert at all. test_entity_subclasses.py asserts this.
-ENTITY_STATUSES = [
-    ("Client", "ordering_institution", "Onboarding", False),
-    ("Client", "ordering_institution", "Active", False),
-    ("Client", "ordering_institution", "Suspended", False),
-    ("Client", "ordering_institution", "Offboarded", True),
-    ("Patient", "patient", "Active", False), ("Patient", "patient", "Inactive", False),
-    ("Patient", "patient", "Deceased", True), ("Patient", "patient", "Merged", True),
-    ("Order", "lab_order", "Placed", False), ("Order", "lab_order", "InProgress", False),
-    ("Order", "lab_order", "Completed", True), ("Order", "lab_order", "Cancelled", True),
-    ("Sample", "raw_specimen", "Received", False), ("Sample", "raw_specimen", "Accessioned", False),
-    ("Sample", "raw_specimen", "QC_Passed", False), ("Sample", "raw_specimen", "Rejected", True),
-    ("Sample", "raw_specimen", "Consumed", True),
-    ("Sample", "library_sample", "Prepped", False), ("Sample", "library_sample", "Loaded", False),
-    ("Sample", "library_sample", "Sequencing", False), ("Sample", "library_sample", "Sequenced", True),
-    ("Sample", "library_sample", "Failed", True),
-    ("Batch", "illumina_run", "Planned", False), ("Batch", "illumina_run", "Loading", False),
-    ("Batch", "illumina_run", "Running", False), ("Batch", "illumina_run", "Complete", True),
-    ("Batch", "illumina_run", "Failed", True),
-    ("Result", "sample_result", "Pending", False), ("Result", "sample_result", "Processing", False),
-    ("Result", "sample_result", "Complete", False), ("Result", "sample_result", "Reviewed", False),
-    ("Result", "sample_result", "Released", False), ("Result", "sample_result", "Archived", True),
-    ("Result", "sample_result", "Failed", True),
-    ("Task", "bioinformatics_pipeline_analysis", "Queued", False),
-    ("Task", "bioinformatics_pipeline_analysis", "Running", False),
-    ("Task", "bioinformatics_pipeline_analysis", "Succeeded", True),
-    ("Task", "bioinformatics_pipeline_analysis", "Failed", True),
-    ("Task", "bioinformatics_pipeline_analysis", "Retrying", False),
-    ("Task", "bioinformatics_pipeline_analysis", "Cancelled", True),
-    ("Task", "data_archiving", "Queued", False), ("Task", "data_archiving", "Running", False),
-    ("Task", "data_archiving", "Succeeded", True), ("Task", "data_archiving", "Failed", True),
-    ("Task", "data_archiving", "Retrying", False), ("Task", "data_archiving", "Cancelled", True),
-]
+__all__ = ["ENTITY_STATUSES_CSV", "ENTITY_TYPES_CSV", "seed_taxonomy", "sync_taxonomy"]
 
-__all__ = ["ENTITY_STATUSES", "ENTITY_TYPES", "seed_taxonomy"]
+
+def sync_taxonomy(
+    session: Session, *, delete_missing: bool = False, dry_run: bool = False
+) -> TaxonomyDiff:
+    """
+    Reconcile the database with the CSVs: insert what is new, update what
+    changed, and report what the files no longer mention. Safe to re-run --
+    an unchanged pair of files produces no writes.
+
+    The caller commits.
+    """
+    return sync_taxonomy_from_csv(
+        session,
+        ENTITY_TYPES_CSV,
+        ENTITY_STATUSES_CSV,
+        delete_missing=delete_missing,
+        dry_run=dry_run,
+    )
 
 
 def seed_taxonomy(session: Session) -> None:
-    """Insert the taxonomy above. Call once against a fresh database."""
-    session.add_all(
-        EntityType(category=c, subcategory=s, description=d) for c, s, d in ENTITY_TYPES
-    )
-    # Flush the parent rows before adding the children: the entity_type ->
-    # entity_status dependency is a table-level ForeignKeyConstraint with no
-    # ORM relationship() behind it, so the unit of work has nothing to sort
-    # these two INSERT batches by and may emit entity_status first.
-    session.flush()
-    session.add_all(
-        EntityStatus(category=c, subcategory=s, status=st, is_terminal=t)
-        for c, s, st, t in ENTITY_STATUSES
-    )
+    """Seed a fresh database. Kept as the name callers already use; it is now
+    sync_taxonomy plus the commit, and works on a populated database too."""
+    sync_taxonomy(session)
     session.commit()
 
 
 if __name__ == "__main__":
-    # Bootstrap a dev/test database in one call. Pair schema changes with
-    # Alembic rather than create_all() in anything longer-lived than this.
     from sqlalchemy import create_engine
 
     from entitymodel.models import Base
 
-    url = sys.argv[1] if len(sys.argv) > 1 else "postgresql+psycopg2://localhost/lab_platform"
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    url = args[0] if args else "postgresql+psycopg2://localhost/lab_platform"
     engine = create_engine(url)
-    Base.metadata.create_all(engine)
-    with Session(engine) as session:
-        seed_taxonomy(session)
-    print(f"created schema and seeded taxonomy in {url}")
+
+    if "--dry-run" in sys.argv:
+        with Session(engine) as session:
+            print(sync_taxonomy(session, dry_run=True).summary())
+    elif "--sync" in sys.argv:
+        with Session(engine) as session:
+            diff = sync_taxonomy(session, delete_missing="--delete-missing" in sys.argv)
+            session.commit()
+        print(diff.summary() if diff else "taxonomy already matches the CSVs")
+    else:
+        # Bootstrap a dev/test database in one call. Use Alembic rather than
+        # create_all() for anything longer-lived than this.
+        Base.metadata.create_all(engine)
+        with Session(engine) as session:
+            seed_taxonomy(session)
+        print(f"created schema and seeded taxonomy in {url}")

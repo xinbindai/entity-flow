@@ -18,10 +18,13 @@ The full design, including the alternative schema that was evaluated and rejecte
 | `entitymodel/` | The reusable half — schema and outbox machinery, no domain knowledge. This is what gets packaged. |
 | `entitymodel/models.py` | SQLAlchemy models: `Entity` and its polymorphic subclasses, the event log, checkpoint and failure tables |
 | `entitymodel/outbox.py` | `fire_event`, `poll_and_dispatch`, `replay`, `dead_lettered`, `HandlerRegistry`, `listen` |
-| `entitymodel/*.sql` | The same schema as reference DDL, with the design rationale in comments |
-| `taxonomy.py` | **This** lab's entity types and their state machines. Another deployment replaces this file. |
+| `entitymodel/taxonomy_sync.py` | Load a taxonomy from CSV and reconcile the database with it |
+| `entitymodel/*.sql` | The schema as reference DDL, with the design rationale in comments. Tables only — the taxonomy rows live in the CSVs |
+| `taxonomy.py` | Points at **this** lab's taxonomy CSVs. Another deployment replaces the CSVs. |
+| `entity_types.csv`, `entity_statuses.csv` | The taxonomy itself — editable without touching Python |
 | `demo.py` | A worked example: one handler, a scripted walkthrough, and a runnable worker |
-| `test/` | Seven suites, 74 tests, run against a real PostgreSQL |
+| `test/` | Eight suites, 91 tests, run against a real PostgreSQL |
+| `migrations/` | Alembic revisions; `alembic.ini` at the root |
 
 ## Setup
 
@@ -121,14 +124,67 @@ test/test_event_timing.py        14 passed
 test/test_poll_and_dispatch.py    8 passed
 test/test_registry.py            15 passed
 test/test_replay.py               9 passed
+test/test_taxonomy_sync.py       17 passed
 ```
 
 Each suite creates a dedicated `poll_test` schema, runs, and drops it, so nothing else in the
 database is touched. They are plain scripts using `assert`, so pytest is not required — but
 they are pytest-shaped, so `pytest test/` works if you add it.
 
-## Known gaps
+## The taxonomy
 
-- **No migrations.** `create_all()` builds a correct schema from scratch but never issues
-  `ALTER`, so it cannot upgrade an existing database. Worth setting up Alembic before the
-  next schema change.
+Which `(category, subcategory)` pairs exist and what statuses each may hold is **data, not
+schema** — a new entity subcategory is an `INSERT`, not a migration. It lives in two CSVs at
+the root, so a domain expert can edit it without touching Python:
+
+```
+entity_types.csv      category,subcategory,description
+entity_statuses.csv   category,subcategory,status,is_terminal
+```
+
+Edit them, then reconcile the database:
+
+```console
+$ python taxonomy.py postgresql+psycopg2://localhost/lab --dry-run
+types +1 ~1 -0; statuses +2 ~1 -0
+
+$ python taxonomy.py postgresql+psycopg2://localhost/lab --sync
+types +1 ~1 -0; statuses +2 ~1 -0
+
+$ python taxonomy.py postgresql+psycopg2://localhost/lab --sync
+taxonomy already matches the CSVs
+```
+
+New rows are inserted, changed descriptions and `is_terminal` flags are updated, and rows the
+CSVs no longer mention are **reported but not deleted**. Deleting is opt-in
+(`--delete-missing`) and refuses outright if live entities still use the row — nothing
+references `entity_status` by foreign key, so an unchecked delete would succeed and then
+strand those entities, unable to be updated because the trigger rejects the status they
+already hold.
+
+The loader also refuses a subcategory with no statuses, which is impossible to insert rather
+than merely empty, and a status naming a subcategory the types file doesn't declare.
+
+`entitymodel.taxonomy_sync` is the reusable half — `sync_taxonomy_from_csv(session, types,
+statuses)` works for any deployment.
+
+
+## Migrations
+
+Schema changes go through Alembic. `create_all()` builds a correct schema from scratch but
+never issues `ALTER`, so it cannot upgrade a database that already exists.
+
+```bash
+alembic upgrade head                       # apply everything
+alembic check                              # fail if the models have drifted
+alembic revision --autogenerate -m "..."   # draft the next revision
+```
+
+The URL comes from `POSTGRES_URL` — environment or `.env` — so `alembic.ini` holds no
+credentials. If you have a database that already matches the models, `alembic stamp head`
+adopts it without re-running anything.
+
+One thing autogenerate will not do for you: it compares tables, columns, indexes and
+constraints, and is **blind to functions and triggers**. The entity status-validation
+trigger is written by hand in the initial revision, and any revision that changes it has to
+say so explicitly.

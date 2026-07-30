@@ -35,16 +35,14 @@ CREATE TABLE entity_type (
     PRIMARY KEY (category, subcategory)
 );
 
-INSERT INTO entity_type (category, subcategory, description) VALUES
-    ('Client',  'ordering_institution',              'Ordering institution or practice that submits lab orders'),
-    ('Patient', 'patient',                          'Root clinical identity'),
-    ('Order',   'lab_order',                        'Test requisition'),
-    ('Sample',  'raw_specimen',                      'Physical specimen as collected'),
-    ('Sample',  'library_sample',                    'Prepped library/aliquot ready for sequencing'),
-    ('Batch',   'illumina_run',                      'A sequencing run pooling many library samples'),
-    ('Result',  'sample_result',                     'Pipeline output for one or more library samples'),
-    ('Task',    'bioinformatics_pipeline_analysis',  'Async pipeline execution task'),
-    ('Task',    'data_archiving',                    'Async data archival task');
+-- The rows themselves are not listed here. The taxonomy is data, not schema,
+-- and it lives in one place only: entity_types.csv and entity_statuses.csv at
+-- the repo root. Load or reconcile them with
+--
+--     python taxonomy.py <url> --sync
+--
+-- which inserts what is new and updates what changed. Duplicating the rows
+-- into this file would give a second copy to keep in step by hand.
 
 -- 2. Valid statuses per subcategory -- documents, and (via the trigger
 --    below) enforces, the state machine each subcategory owns, replacing
@@ -58,56 +56,11 @@ CREATE TABLE entity_status (
     FOREIGN KEY (category, subcategory) REFERENCES entity_type (category, subcategory)
 );
 
--- Every subcategory in entity_type needs at least one row here: the trigger
--- below rejects any status without a matching (category, subcategory, status)
--- row, so a subcategory with no statuses can never be inserted at all.
-INSERT INTO entity_status (category, subcategory, status, is_terminal) VALUES
-    ('Client', 'ordering_institution',             'Onboarding', false),
-    ('Client', 'ordering_institution',             'Active', false),
-    ('Client', 'ordering_institution',             'Suspended', false),
-    ('Client', 'ordering_institution',             'Offboarded', true),
-    ('Patient','patient',                          'Active', false),
-    ('Patient','patient',                          'Inactive', false),
-    ('Patient','patient',                          'Deceased', true),
-    ('Patient','patient',                          'Merged', true),
-    ('Order',  'lab_order',                        'Placed', false),
-    ('Order',  'lab_order',                        'InProgress', false),
-    ('Order',  'lab_order',                        'Completed', true),
-    ('Order',  'lab_order',                        'Cancelled', true),
-    ('Sample', 'raw_specimen',                     'Received', false),
-    ('Sample', 'raw_specimen',                     'Accessioned', false),
-    ('Sample', 'raw_specimen',                     'QC_Passed', false),
-    ('Sample', 'raw_specimen',                     'Rejected', true),
-    ('Sample', 'raw_specimen',                     'Consumed', true),
-    ('Sample', 'library_sample',                   'Prepped', false),
-    ('Sample', 'library_sample',                   'Loaded', false),
-    ('Sample', 'library_sample',                   'Sequencing', false),
-    ('Sample', 'library_sample',                   'Sequenced', true),
-    ('Sample', 'library_sample',                   'Failed', true),
-    ('Batch',  'illumina_run',                     'Planned', false),
-    ('Batch',  'illumina_run',                     'Loading', false),
-    ('Batch',  'illumina_run',                     'Running', false),
-    ('Batch',  'illumina_run',                     'Complete', true),
-    ('Batch',  'illumina_run',                     'Failed', true),
-    ('Result', 'sample_result',                    'Pending', false),
-    ('Result', 'sample_result',                    'Processing', false),
-    ('Result', 'sample_result',                    'Complete', false),
-    ('Result', 'sample_result',                    'Reviewed', false),
-    ('Result', 'sample_result',                    'Released', false),
-    ('Result', 'sample_result',                    'Archived', true),
-    ('Result', 'sample_result',                    'Failed', true),
-    ('Task',   'bioinformatics_pipeline_analysis', 'Queued', false),
-    ('Task',   'bioinformatics_pipeline_analysis', 'Running', false),
-    ('Task',   'bioinformatics_pipeline_analysis', 'Succeeded', true),
-    ('Task',   'bioinformatics_pipeline_analysis', 'Failed', true),
-    ('Task',   'bioinformatics_pipeline_analysis', 'Retrying', false),
-    ('Task',   'bioinformatics_pipeline_analysis', 'Cancelled', true),
-    ('Task',   'data_archiving',                   'Queued', false),
-    ('Task',   'data_archiving',                   'Running', false),
-    ('Task',   'data_archiving',                   'Succeeded', true),
-    ('Task',   'data_archiving',                   'Failed', true),
-    ('Task',   'data_archiving',                   'Retrying', false),
-    ('Task',   'data_archiving',                   'Cancelled', true);
+-- Rows come from entity_statuses.csv, as above. Every subcategory in
+-- entity_type needs at least one row here: the trigger below rejects any
+-- status without a matching (category, subcategory, status) row, so a
+-- subcategory with no statuses can never be inserted at all. The CSV loader
+-- refuses that combination rather than letting it reach the database.
 
 -- Example `attributes` shapes -- documented convention, not enforced by
 -- the database (validate at the application layer or with a JSON Schema

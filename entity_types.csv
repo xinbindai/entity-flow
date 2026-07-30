@@ -1,0 +1,10 @@
+category,subcategory,description
+Client,ordering_institution,Ordering institution or practice that submits lab orders
+Patient,patient,Root clinical identity
+Order,lab_order,Test requisition
+Sample,raw_specimen,Physical specimen as collected
+Sample,library_sample,Prepped library/aliquot ready for sequencing
+Batch,illumina_run,A sequencing run pooling many library samples
+Result,sample_result,Pipeline output for one or more library samples
+Task,bioinformatics_pipeline_analysis,Async pipeline execution task
+Task,data_archiving,Async data archival task
