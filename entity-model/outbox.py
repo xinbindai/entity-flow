@@ -23,6 +23,7 @@ See demo.py for a worked example and test/ for the behaviour they guarantee.
 
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
 import uuid
@@ -144,11 +145,10 @@ def fire_event(
 # bounding that needs a watermark or a claim-based drain (see the
 # published_at/publish_attempts columns on EventRecord).
 #
-# Single-consumer as written: there's no FOR UPDATE SKIP LOCKED, so two
-# processes running the same handler_name will both select the same rows and
-# both run the side effect. The checkpoint primary key turns that into a
-# unique violation on the second commit rather than a silent duplicate, but
-# the handler's writes have already happened by then.
+# Safe to run from several worker processes at once. This SELECT is only a
+# candidate list -- two workers will happily return overlapping rows -- so
+# mutual exclusion happens per event at dispatch time, via an advisory lock
+# on the (handler_name, event_id) pair. See _dispatch and _lock_key.
 # --------------------------------------------------------------------------
 def poll_and_dispatch(
     session: Session,
@@ -175,6 +175,11 @@ def poll_and_dispatch(
     A failed event is held back for backoff_seconds * 2**(attempts-1), capped
     at max_backoff_seconds, so retries spread out instead of firing on every
     poll.
+
+    Safe to run concurrently from several workers under the same
+    handler_name: each event is claimed with an advisory lock before its
+    handler runs, and an event another worker already holds is skipped rather
+    than waited on, so the batch keeps moving.
 
     Note the two limits behave differently on a config change. max_attempts is
     compared against the stored counter at selection time, so raising it
@@ -230,7 +235,8 @@ def poll_and_dispatch(
 
     return _dispatch(
         session, handler_name, pending, handle,
-        overwrite_checkpoint=False, record_failures=True,
+        overwrite_checkpoint=False, record_failures=True, claim="try",
+        max_attempts=max_attempts,
         backoff_seconds=backoff_seconds, max_backoff_seconds=max_backoff_seconds,
     )
 
@@ -259,15 +265,76 @@ def dead_lettered(
 
 
 # --------------------------------------------------------------------------
+# Claiming, so several worker processes can run the same handler safely.
+#
+# The lock is on the (handler_name, event_id) pair, not on the event row. A
+# row lock would be wrong twice over: `events` is shared by every handler, so
+# locking a row for one handler would block all the others and destroy the
+# fan-out the event log exists to provide; and events are immutable facts,
+# not queue entries, so nothing should be taking write locks on them at all.
+#
+# A transaction-scoped advisory lock has exactly the right lifetime -- it is
+# released by the same commit that writes the checkpoint, so the claim and
+# the work it protects can never disagree, even if the process is killed.
+#
+# The key is hashed in Python rather than with hashtext()/hashtextextended(),
+# which are undocumented internals. Advisory locks share a database-wide
+# namespace, hence the "outbox:" prefix; the one-argument form used here is a
+# separate space from the two-argument form, so it can't collide with code
+# using pg_advisory_lock(int, int).
+# --------------------------------------------------------------------------
+def _lock_key(handler_name: str, event_id: uuid.UUID) -> int:
+    digest = hashlib.blake2b(
+        f"outbox:{handler_name}:{event_id}".encode(), digest_size=8
+    ).digest()
+    return int.from_bytes(digest, "big", signed=True)
+
+
+def _settled(session: Session, handler_name: str, event_id: uuid.UUID, max_attempts: int) -> bool:
+    """
+    Has another worker finished (or given up on) this event since we selected
+    it? Must run as its own statement *after* the claim is held: under READ
+    COMMITTED each statement takes a fresh snapshot, so folding this into the
+    same SELECT as the lock would test a snapshot taken before the lock was
+    acquired and reintroduce the race it exists to close.
+    """
+    return bool(
+        session.scalar(
+            select(
+                select(EventHandlerCheckpoint.event_id)
+                .where(
+                    EventHandlerCheckpoint.handler_name == handler_name,
+                    EventHandlerCheckpoint.event_id == event_id,
+                )
+                .exists()
+                | select(EventHandlerFailure.event_id)
+                .where(
+                    EventHandlerFailure.handler_name == handler_name,
+                    EventHandlerFailure.event_id == event_id,
+                    or_(
+                        EventHandlerFailure.attempts >= max_attempts,
+                        EventHandlerFailure.next_attempt_at > func.statement_timestamp(),
+                    ),
+                )
+                .exists()
+            )
+        )
+    )
+
+
+# --------------------------------------------------------------------------
 # Shared dispatch loop. Each event is its own "Transaction 2": the handler's
 # writes and that event's checkpoint commit together, so a crash mid-batch
 # leaves earlier events durably processed and the rest untouched.
 #
 # overwrite_checkpoint distinguishes the two callers. poll_and_dispatch has
-# already filtered out anything checkpointed, so a plain INSERT is correct --
-# and if a second consumer raced it, the primary key raises rather than
-# silently double-processing. replay() targets rows that usually DO have a
-# checkpoint, so it upserts instead.
+# already filtered out anything checkpointed, so a plain INSERT is correct.
+# replay() targets rows that usually DO have a checkpoint, so it upserts.
+#
+# claim likewise: pollers try for the claim and skip an event another worker
+# already holds, which is the SKIP LOCKED behaviour applied to the right
+# object. replay() waits for it instead -- an operator asked for this event
+# specifically, so silently skipping it would be the wrong answer.
 # --------------------------------------------------------------------------
 def _dispatch(
     session: Session,
@@ -277,6 +344,8 @@ def _dispatch(
     *,
     overwrite_checkpoint: bool,
     record_failures: bool,
+    claim: str = "try",  # "try" | "wait"
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     backoff_seconds: float = DEFAULT_BACKOFF_SECONDS,
     max_backoff_seconds: float = DEFAULT_MAX_BACKOFF_SECONDS,
 ) -> int:
@@ -286,6 +355,21 @@ def _dispatch(
         # Captured before dispatch: a rollback expires `ev`, and reading the
         # attribute afterwards would cost an extra round trip.
         event_id = ev.event_id
+        key = _lock_key(handler_name, event_id)
+
+        if claim == "try":
+            if not session.scalar(select(func.pg_try_advisory_xact_lock(key))):
+                # Another worker holds this (handler, event). It is theirs to
+                # finish; we move on rather than block the rest of the batch.
+                session.rollback()
+                continue
+            if _settled(session, handler_name, event_id, max_attempts):
+                # They finished it between our SELECT and our claim.
+                session.rollback()
+                continue
+        else:
+            session.execute(select(func.pg_advisory_xact_lock(key)))
+
         try:
             handle(session, ev)
             if overwrite_checkpoint:
@@ -412,6 +496,11 @@ def replay(
     counted -- replay is operator-invoked, so the error should surface. A
     successful dispatch clears any failure history for that (handler, event).
 
+    Also unlike poll_and_dispatch, this waits for each event's claim instead
+    of skipping it: if a worker is mid-dispatch on the same event, replay
+    blocks until that finishes rather than running concurrently with it or
+    silently doing nothing.
+
     Raises ValueError if any id doesn't exist -- during an incident a typo'd
     UUID should say so, not silently do nothing.
 
@@ -435,7 +524,7 @@ def replay(
 
     return _dispatch(
         session, handler_name, events, handle,
-        overwrite_checkpoint=True, record_failures=False,
+        overwrite_checkpoint=True, record_failures=False, claim="wait",
     )
 
 

@@ -13,20 +13,28 @@ Run it against Postgres; models.py uses JSONB, gen_random_uuid() and a
 PL/pgSQL trigger that only exist there:
 
     pip install "sqlalchemy>=2.0" psycopg2-binary
+
+    # scripted walkthrough: rebuild the schema, produce one event, consume it
     python demo.py postgresql+psycopg2://localhost/lab_platform_demo
+
+    # the same handlers as a long-running worker (see run_worker) -- run this
+    # in a second terminal, or several, against a schema that already exists
+    python demo.py postgresql+psycopg2://localhost/lab_platform_demo --worker
 """
 
 from __future__ import annotations
 
+import signal
 import sys
+import threading
 import uuid
 
 from sqlalchemy import create_engine, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from models import Base, EventRecord, Result, Task
 from taxonomy import seed_taxonomy
-from outbox import HandlerRegistry, dispatch_once, fire_event
+from outbox import HandlerRegistry, dispatch_once, fire_event, listen
 
 
 # --------------------------------------------------------------------------
@@ -123,6 +131,51 @@ def main(db_url: str) -> None:
             print(f"  {e.event_type:22s} entity={e.entity_type:8s} causation_id={e.causation_id}")
 
 
+# --------------------------------------------------------------------------
+# What a real consumer process looks like. main() above steps the consumer by
+# hand to show idempotency; this is the shape you would actually deploy.
+#
+# listen() needs a session *factory*, not a session: it opens one per cycle
+# and closes it at the end, so an idle worker never sits in an open
+# transaction holding back vacuum. sessionmaker(engine) is exactly such a
+# factory -- calling it returns a new Session -- and `lambda: Session(engine)`
+# would do just as well.
+#
+# Several copies of this process can run against the same database. Each event
+# is claimed per (handler, event) before its handler runs, so workers skip
+# what someone else is already doing rather than duplicating it.
+# --------------------------------------------------------------------------
+def run_worker(db_url: str) -> None:
+    engine = create_engine(
+        db_url,
+        # Long-lived workers outlive their connections; without this a
+        # database restart or an idle-timeout proxy kills the next cycle.
+        pool_pre_ping=True,
+    )
+    session_factory = sessionmaker(engine)
+
+    stop = threading.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: stop.set())
+
+    print(f"worker started against {db_url}")
+    print(f"  handlers: {', '.join(registry.names())}")
+    print("  Ctrl-C or SIGTERM to stop")
+
+    processed = listen(session_factory, registry, poll_interval=1.0, stop=stop)
+
+    print(f"worker stopped after processing {processed} event(s)")
+    engine.dispose()
+
+
 if __name__ == "__main__":
-    url = sys.argv[1] if len(sys.argv) > 1 else "postgresql+psycopg2://localhost/lab_platform_demo"
-    main(url)
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    url = args[0] if args else "postgresql+psycopg2://localhost/lab_platform_demo"
+
+    if "--worker" in sys.argv:
+        # Consumes whatever the scripted run (or anything else) produces.
+        # Assumes the schema already exists -- unlike main(), this drops
+        # nothing.
+        run_worker(url)
+    else:
+        main(url)
