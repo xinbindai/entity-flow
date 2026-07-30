@@ -1,10 +1,10 @@
 """
 The lab's entity taxonomy: which (category, subcategory) pairs exist and what
 statuses each one may hold. Mirrors the INSERT statements in
-entity_schema_unified.sql -- keep the two in step.
+entitymodel/entity_schema_unified.sql -- keep the two in step.
 
 This is domain configuration, not schema, which is why it lives here rather
-than in models.py: models.py defines the shape of any entity-event-task
+than in entitymodel/models.py: models.py defines the shape of any entity-event-task
 system, while this file says what *this* lab's entities are. A different
 deployment keeps models.py verbatim and replaces this file.
 
@@ -23,7 +23,7 @@ import sys
 
 from sqlalchemy.orm import Session
 
-from models import EntityStatus, EntityType
+from entitymodel.models import EntityStatus, EntityType
 
 # (category, subcategory, description)
 ENTITY_TYPES = [
@@ -102,7 +102,7 @@ if __name__ == "__main__":
     # Alembic rather than create_all() in anything longer-lived than this.
     from sqlalchemy import create_engine
 
-    from models import Base
+    from entitymodel.models import Base
 
     url = sys.argv[1] if len(sys.argv) > 1 else "postgresql+psycopg2://localhost/lab_platform"
     engine = create_engine(url)

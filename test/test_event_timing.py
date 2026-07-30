@@ -36,8 +36,8 @@ from testdata import (  # noqa: E402
     make_task,
 )
 
-from outbox import fire_event  # noqa: E402
-from models import EventRecord, Task  # noqa: E402
+from entitymodel.outbox import fire_event  # noqa: E402
+from entitymodel.models import EventRecord, Task  # noqa: E402
 
 
 def test_occurred_at_is_required(session: Session) -> None:

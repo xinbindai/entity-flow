@@ -28,8 +28,8 @@ from testdata import (  # noqa: E402
 )
 
 from demo import create_sample_result_on_analysis_succeeded  # noqa: E402
-from models import EventHandlerCheckpoint, Result  # noqa: E402
-from outbox import poll_and_dispatch, replay  # noqa: E402
+from entitymodel.models import EventHandlerCheckpoint, Result  # noqa: E402
+from entitymodel.outbox import poll_and_dispatch, replay  # noqa: E402
 
 HANDLER = "create-sample-result"
 TYPES = ["AnalysisTaskSucceeded"]

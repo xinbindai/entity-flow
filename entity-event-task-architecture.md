@@ -289,15 +289,18 @@ A Sample Result should pin immutable references at creation time — pipeline ve
 
 ## 7. Implementation artifacts
 
-This design was carried through to working code, produced alongside this document:
+This design was carried through to working code, produced alongside this document.
+
+`entitymodel/` is the reusable half — schema and outbox machinery, with no knowledge of sequencing labs — so another deployment can take the package unchanged. Everything domain-specific sits at the repo root: `taxonomy.py` names this lab's entity types and statuses, `demo.py` its handlers.
+
 
 | File | Contents |
 |---|---|
-| `entity_schema_unified.sql` | The entity schema (§2.4) — taxonomy, status trigger, relationship graph |
-| `events_schema.sql` | The event log/outbox table (§3.1), the per-handler checkpoint table and the retry/dead-letter table (§5.3) |
-| `models.py` | SQLAlchemy 2.0 ORM models for the unified schema, including polymorphic `Task`/`Patient`/`Sample`/etc. subclasses of `Entity`, and the DDL wiring for the status-validation trigger. Schema only — no domain data, so a different deployment can use it verbatim |
+| `entitymodel/entity_schema_unified.sql` | The entity schema (§2.4) — taxonomy, status trigger, relationship graph |
+| `entitymodel/events_schema.sql` | The event log/outbox table (§3.1), the per-handler checkpoint table and the retry/dead-letter table (§5.3) |
+| `entitymodel/models.py` | SQLAlchemy 2.0 ORM models for the unified schema, including polymorphic `Task`/`Patient`/`Sample`/etc. subclasses of `Entity`, and the DDL wiring for the status-validation trigger. Schema only — no domain data, so a different deployment can use it verbatim |
 | `taxonomy.py` | This lab's `entity_type` / `entity_status` rows and `seed_taxonomy()`. Domain configuration rather than schema, and required before any entity can be inserted; `python taxonomy.py <url>` bootstraps a dev database |
-| `outbox.py` | The reusable primitives, domain-independent: `fire_event()` (the transactional-outbox write, §4.1), `poll_and_dispatch()` (the checkpointed consumer, with retry limiting and exponential backoff, §5.3), `replay()` (targeted re-dispatch of specific events to one handler), `dead_lettered()` (events a handler has given up on), and the worker layer on top: `HandlerRegistry` / `dispatch_once()` / `listen()` |
+| `entitymodel/outbox.py` | The reusable primitives, domain-independent: `fire_event()` (the transactional-outbox write, §4.1), `poll_and_dispatch()` (the checkpointed consumer, with retry limiting and exponential backoff, §5.3), `replay()` (targeted re-dispatch of specific events to one handler), `dead_lettered()` (events a handler has given up on), and the worker layer on top: `HandlerRegistry` / `dispatch_once()` / `listen()` |
 | `demo.py` | Runnable walkthrough built on `outbox.py`, plus the domain-specific `create-sample-result` handler and its registry subscription: takes a task from `Succeeded` through to a created `SampleResult`, with a second poll showing idempotent no-op behavior |
 | `test/testdata.py` | Test data builders plus schema setup/teardown, isolated in a dedicated `poll_test` Postgres schema; reads `POSTGRES_URL` from `.env` |
 | `test/test_poll_and_dispatch.py` | Consumer tests (§5.3): dispatch, per-handler idempotency, independent handler progress, event-type filtering, batching and order, and an assertion that the polling query plans as an anti-join |

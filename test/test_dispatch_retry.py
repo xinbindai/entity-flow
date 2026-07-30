@@ -27,8 +27,8 @@ from testdata import (  # noqa: E402
     make_task,
 )
 
-from models import EventHandlerCheckpoint, EventHandlerFailure  # noqa: E402
-from outbox import dead_lettered, poll_and_dispatch, replay  # noqa: E402
+from entitymodel.models import EventHandlerCheckpoint, EventHandlerFailure  # noqa: E402
+from entitymodel.outbox import dead_lettered, poll_and_dispatch, replay  # noqa: E402
 
 HANDLER = "flaky-handler"
 TYPES = ["AnalysisTaskSucceeded"]

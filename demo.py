@@ -32,9 +32,9 @@ import uuid
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from models import Base, EventRecord, Result, Task
+from entitymodel.models import Base, EventRecord, Result, Task
 from taxonomy import seed_taxonomy
-from outbox import HandlerRegistry, dispatch_once, fire_event, listen
+from entitymodel.outbox import HandlerRegistry, dispatch_once, fire_event, listen
 
 
 # --------------------------------------------------------------------------

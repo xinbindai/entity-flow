@@ -5,7 +5,7 @@ Everything is created inside a dedicated `poll_test` Postgres schema rather
 than `public`, so running these tests never touches anything else in the
 database and teardown is a single DROP SCHEMA ... CASCADE.
 
-Connection URL comes from entity-model/.env (POSTGRES_URL).
+Connection URL comes from .env at the repo root (POSTGRES_URL).
 """
 
 from __future__ import annotations
@@ -16,13 +16,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-ENTITY_MODEL = HERE.parent
-sys.path.insert(0, str(ENTITY_MODEL))
+REPO_ROOT = HERE.parent
+# Puts the entitymodel package, taxonomy.py and demo.py on the path, so these
+# suites run as plain scripts from anywhere without installing the project.
+sys.path.insert(0, str(REPO_ROOT))
 
 from sqlalchemy import create_engine, text  # noqa: E402
 from sqlalchemy.orm import Session  # noqa: E402
 
-from models import Base, EventRecord, Task  # noqa: E402
+from entitymodel.models import Base, EventRecord, Task  # noqa: E402
 from taxonomy import seed_taxonomy  # noqa: E402
 
 TEST_SCHEMA = "poll_test"
@@ -34,10 +36,10 @@ BASE_TIME = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
 
 def load_env(path: Path | None = None) -> dict[str, str]:
     """Minimal .env reader -- avoids a python-dotenv dependency."""
-    path = path or (ENTITY_MODEL / ".env")
+    path = path or (REPO_ROOT / ".env")
     if not path.exists():
         raise SystemExit(
-            f"{path} not found. Copy {ENTITY_MODEL / '.env.example'} to .env "
+            f"{path} not found. Copy {REPO_ROOT / '.env.example'} to .env "
             f"and set POSTGRES_URL to a database you can create schemas in."
         )
     values: dict[str, str] = {}
@@ -54,10 +56,18 @@ def make_engine(echo: bool = False):
     url = load_env()["POSTGRES_URL"]
     # search_path pins every table, the trigger function and gen_random_uuid()
     # lookups into the test schema.
+    #
+    # timezone=UTC pins what the driver hands back. timestamptz stores an
+    # absolute instant and is rendered in the *session's* zone, so on a server
+    # set to a local zone the same correct instant comes back as, say,
+    # 06:00-06:00 instead of 12:00+00:00. The timing tests assert
+    # utcoffset() == 0, which would then fail on data that is perfectly fine.
+    # Pinning it makes that assumption explicit and the tests reproducible on
+    # any machine, rather than passing by accident where the server is UTC.
     return create_engine(
         url,
         echo=echo,
-        connect_args={"options": f"-csearch_path={TEST_SCHEMA},public"},
+        connect_args={"options": f"-csearch_path={TEST_SCHEMA},public -ctimezone=UTC"},
     )
 
 

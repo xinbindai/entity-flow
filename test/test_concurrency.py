@@ -34,8 +34,8 @@ from testdata import (  # noqa: E402
     make_task,
 )
 
-from models import EventHandlerCheckpoint, EventHandlerFailure  # noqa: E402
-from outbox import poll_and_dispatch, replay  # noqa: E402
+from entitymodel.models import EventHandlerCheckpoint, EventHandlerFailure  # noqa: E402
+from entitymodel.outbox import poll_and_dispatch, replay  # noqa: E402
 
 TYPES = ["AnalysisTaskSucceeded"]
 

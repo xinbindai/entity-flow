@@ -23,7 +23,7 @@ from testdata import (  # noqa: E402
     make_engine,
 )
 
-from models import (  # noqa: E402
+from entitymodel.models import (  # noqa: E402
     Client,
     Entity,
     EntityStatus,

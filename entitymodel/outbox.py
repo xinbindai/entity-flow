@@ -35,7 +35,7 @@ from sqlalchemy import delete, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from models import Entity, EventHandlerCheckpoint, EventHandlerFailure, EventRecord
+from entitymodel.models import Entity, EventHandlerCheckpoint, EventHandlerFailure, EventRecord
 
 # A handler receives the open session and one event, and does its own writes
 # on that session. It must not commit -- poll_and_dispatch commits the
