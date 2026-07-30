@@ -21,3 +21,8 @@ build-backend = "hatchling.build"
 # importable when running from the repo root, which is how the tests and the
 # scripts run either way.
 packages = ["entitymodel"]
+
+[dependency-groups]
+dev = [
+    "alembic>=1.18.5",
+]

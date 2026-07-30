@@ -1,0 +1,22 @@
+Alembic migrations for entity-flow.
+
+The database URL comes from POSTGRES_URL (environment, or .env at the repo
+root) via env.py -- alembic.ini holds no credentials.
+
+    alembic upgrade head                       apply everything
+    alembic current                            what this database is at
+    alembic check                              fail if models have drifted
+    alembic revision --autogenerate -m "..."   draft the next revision
+    alembic downgrade -1                       step back one
+
+Autogenerate compares tables, columns, indexes and constraints. It is blind to
+functions and triggers, so the entity status-validation trigger is written by
+hand -- see 0a9fc379d832_initial_schema.py. Any revision that changes that
+trigger must say so explicitly; nothing will catch it for you.
+
+Adopting an existing database that already matches the current models:
+
+    alembic stamp head
+
+That records the revision without running it. Only do this when the schema
+really does match; `alembic check` will tell you.
