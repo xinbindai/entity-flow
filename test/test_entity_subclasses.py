@@ -24,12 +24,11 @@ from testdata import (  # noqa: E402
 )
 
 from entitymodel.models import (  # noqa: E402
-    Client,
     Entity,
     EntityStatus,
     EntityType,
-    Patient,
 )
+from taxonomy import Client, Patient  # noqa: E402
 
 
 def test_every_subcategory_has_at_least_one_status(session: Session) -> None:

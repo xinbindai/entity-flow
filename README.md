@@ -16,11 +16,11 @@ The full design, including the alternative schema that was evaluated and rejecte
 | Path | What |
 |---|---|
 | `entitymodel/` | The reusable half — schema and outbox machinery, no domain knowledge. This is what gets packaged. |
-| `entitymodel/models.py` | SQLAlchemy models: `Entity` and its polymorphic subclasses, the event log, checkpoint and failure tables |
+| `entitymodel/models.py` | SQLAlchemy models: `Entity`, `Task`, the event log, checkpoint and failure tables |
 | `entitymodel/outbox.py` | `fire_event`, `poll_and_dispatch`, `replay`, `dead_lettered`, `HandlerRegistry`, `listen` |
 | `entitymodel/taxonomy_sync.py` | Load a taxonomy from CSV and reconcile the database with it |
 | `entitymodel/*.sql` | The schema as reference DDL, with the design rationale in comments. Tables only — the taxonomy rows live in the CSVs |
-| `taxonomy.py` | Points at **this** lab's taxonomy CSVs. Another deployment replaces the CSVs. |
+| `taxonomy.py` | **This** lab's categories — the taxonomy CSVs plus the `Patient`/`Sample`/… subclasses. Another deployment replaces this file. |
 | `entity_types.csv`, `entity_statuses.csv` | The taxonomy itself — editable without touching Python |
 | `demo.py` | A worked example: one handler, a scripted walkthrough, and a runnable worker |
 | `test/` | Eight suites, 91 tests, run against a real PostgreSQL |
@@ -130,6 +130,30 @@ test/test_taxonomy_sync.py       17 passed
 Each suite creates a dedicated `poll_test` schema, runs, and drops it, so nothing else in the
 database is touched. They are plain scripts using `assert`, so pytest is not required — but
 they are pytest-shaped, so `pytest test/` works if you add it.
+
+## Using it from another project
+
+`entitymodel` ships the schema and the outbox machinery, with no domain knowledge. `Entity`
+and `Task` are model concepts and live in the package; everything else is vocabulary you
+supply.
+
+```python
+from entitymodel.models import Base, Entity
+from entitymodel.outbox import HandlerRegistry, dispatch_once, fire_event
+from entitymodel.taxonomy_sync import sync_taxonomy_from_csv
+
+class Ticket(Entity):
+    __mapper_args__ = {"polymorphic_identity": "Ticket"}
+```
+
+Declaring a subclass per category is optional but usually wanted: `category` is the
+polymorphic discriminator, so a category with no subclass loads as a plain `Entity` — and
+constructing `Entity(category="Ticket", ...)` instead of `Ticket(...)` produces a
+`SAWarning` and a row that won't load back as your type. The `polymorphic_identity` must
+equal the category in your CSV exactly, and the module declaring it has to be imported
+before rows of that category are loaded.
+
+`taxonomy.py` is this repo's worked example of that file.
 
 ## The taxonomy
 

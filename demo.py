@@ -32,8 +32,8 @@ import uuid
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from entitymodel.models import Base, EventRecord, Result, Task
-from taxonomy import seed_taxonomy
+from entitymodel.models import Base, EventRecord, Task
+from taxonomy import Result, seed_taxonomy
 from entitymodel.outbox import HandlerRegistry, dispatch_once, fire_event, listen
 
 

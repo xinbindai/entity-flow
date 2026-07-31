@@ -12,15 +12,14 @@ could not:
    about" is no longer a loose (entity_type, entity_id) pair with nothing
    backing it; it's a genuine FK with referential integrity.
 
-2. Task is just another polymorphic subclass of Entity (see the
-   Patient/Order/Sample/Batch/Result/Task classes below), the same way it's
+2. Task is just another polymorphic subclass of Entity, the same way it's
    just another `category` row in entity_type -- confirming in code what
    was established in discussion: a task is an entity.
 
-This module is schema only -- table definitions and the DDL hook for the
-status trigger, nothing domain-specific. Which (category, subcategory) pairs
-exist and which statuses each may hold lives in taxonomy.py, so a different
-deployment can keep this file verbatim and replace that one.
+This module is domain-free: the schema, the DDL hook for the status trigger,
+and Task, which is part of the entity-event-task model itself. A deployment's
+own categories and the taxonomy naming them live in taxonomy.py, so a
+different deployment keeps this file verbatim and replaces that one.
 
 For ongoing schema changes, pair this with Alembic rather than relying on
 create_all() in production -- create_all()/the DDL hooks below are meant
@@ -172,73 +171,22 @@ event.listen(Entity.__table__, "after_create", _validate_status_trigger)
 
 
 # --------------------------------------------------------------------------
-# Polymorphic convenience subclasses -- same table, same rows, just typed
-# Python-side accessors into `attributes` for each category. Optional: you
-# can ignore these entirely and work with plain Entity rows instead.
+# Task: the third of the model's three concepts, and a polymorphic subclass of
+# Entity like any other -- which is the point. A task's execution status is a
+# state machine like any entity's, it is created in reaction to an event like
+# any entity mutation, and it emits its own events on transition. The system
+# has two primitives, not three.
+#
+# Task lives here because it belongs to the model. The lab's own categories --
+# Patient, Sample, Batch and so on -- are domain vocabulary and live beside
+# their taxonomy in taxonomy.py, so a deployment with different entities keeps
+# this package unchanged and declares its own.
+#
+# Subclasses are optional: `category` is the discriminator, so a category with
+# no subclass simply loads as a plain Entity. Declare one when you want typed
+# accessors into `attributes`, and make its polymorphic_identity match the
+# category exactly.
 # --------------------------------------------------------------------------
-class Client(Entity):
-    """The ordering institution or practice that submits lab orders -- the
-    lab's customer, distinct from the Patient a specimen came from.
-
-    A root entity like Patient: no provenance parent, and its link to an Order
-    is an entity_relationship edge (Client --places--> Order), not a column.
-    The institution's name lives in Entity.name, which is unique per
-    (category, subcategory), so two clients can't share a name.
-    """
-
-    __mapper_args__ = {"polymorphic_identity": "Client"}
-
-    @property
-    def account_number(self) -> str | None:
-        return self.attributes.get("account_number")
-
-    @property
-    def billing_contact_email(self) -> str | None:
-        return self.attributes.get("billing_contact_email")
-
-
-class Patient(Entity):
-    __mapper_args__ = {"polymorphic_identity": "Patient"}
-
-    @property
-    def mrn(self) -> str | None:
-        return self.attributes.get("mrn")
-
-
-class Order(Entity):
-    __mapper_args__ = {"polymorphic_identity": "Order"}
-
-    @property
-    def test_panel(self) -> str | None:
-        return self.attributes.get("test_panel")
-
-
-class Sample(Entity):
-    """Covers both raw_specimen and library_sample subcategories."""
-
-    __mapper_args__ = {"polymorphic_identity": "Sample"}
-
-    @property
-    def specimen_type(self) -> str | None:
-        return self.attributes.get("specimen_type")
-
-
-class Batch(Entity):
-    __mapper_args__ = {"polymorphic_identity": "Batch"}
-
-    @property
-    def flow_cell_id(self) -> str | None:
-        return self.attributes.get("flow_cell_id")
-
-
-class Result(Entity):
-    __mapper_args__ = {"polymorphic_identity": "Result"}
-
-    @property
-    def pipeline_version(self) -> str | None:
-        return self.attributes.get("pipeline_version")
-
-
 class Task(Entity):
     """A task is just another entity -- see the class docstring at the top."""
 

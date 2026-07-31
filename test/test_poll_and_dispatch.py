@@ -30,7 +30,8 @@ from testdata import (  # noqa: E402
 
 from demo import create_sample_result_on_analysis_succeeded  # noqa: E402
 from entitymodel.outbox import poll_and_dispatch  # noqa: E402
-from entitymodel.models import EventHandlerCheckpoint, EventRecord, Result  # noqa: E402
+from entitymodel.models import EventHandlerCheckpoint, EventRecord  # noqa: E402
+from taxonomy import Result  # noqa: E402
 
 HANDLER = "create-sample-result-on-analysis-succeeded"
 
