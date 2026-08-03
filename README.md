@@ -19,11 +19,13 @@ The full design, including the alternative schema that was evaluated and rejecte
 | `entitymodel/models.py` | SQLAlchemy models: `Entity`, `Task`, the event log, checkpoint and failure tables |
 | `entitymodel/outbox.py` | `fire_event`, `poll_and_dispatch`, `replay`, `dead_lettered`, `HandlerRegistry`, `listen` |
 | `entitymodel/taxonomy_sync.py` | Load a taxonomy from CSV and reconcile the database with it |
+| `entitymodel/celery_tasks.py` | Submit Celery tasks that are also `Task` entities, and drive the row through its lifecycle |
+| `entitymodel/celery_workers.py` | Start, stop and supervise a Celery worker fleet from a config dict |
 | `entitymodel/*.sql` | The schema as reference DDL, with the design rationale in comments. Tables only — the taxonomy rows live in the CSVs |
 | `taxonomy.py` | **This** lab's categories — the taxonomy CSVs plus the `Patient`/`Sample`/… subclasses. Another deployment replaces this file. |
 | `entity_types.csv`, `entity_statuses.csv` | The taxonomy itself — editable without touching Python |
 | `demo.py` | A worked example: one handler, a scripted walkthrough, and a runnable worker |
-| `test/` | Eight suites, 91 tests, run against a real PostgreSQL |
+| `test/` | Ten suites, 123 tests, run against a real PostgreSQL |
 | `migrations/` | Alembic revisions; `alembic.ini` at the root |
 
 ## Setup
@@ -125,6 +127,8 @@ test/test_poll_and_dispatch.py    8 passed
 test/test_registry.py            15 passed
 test/test_replay.py               9 passed
 test/test_taxonomy_sync.py       17 passed
+test/test_celery_tasks.py        17 passed
+test/test_celery_workers.py      15 passed
 ```
 
 Each suite creates a dedicated `poll_test` schema, runs, and drops it, so nothing else in the
@@ -192,6 +196,64 @@ than merely empty, and a status naming a subcategory the types file doesn't decl
 `entitymodel.taxonomy_sync` is the reusable half — `sync_taxonomy_from_csv(session, types,
 statuses)` works for any deployment.
 
+
+## Running tasks on Celery
+
+`Task` is already an entity, so a Celery job and its durable record are the same thing. The
+row is written first and the message sent second, so a worker can never receive an id that
+isn't in the database yet.
+
+Submit from the command line, payload in a JSON file:
+
+```bash
+python -m entitymodel.celery_tasks \
+    --app myapp.celery:app --db-url postgresql+psycopg2://localhost/lab \
+    --task myapp.run_pipeline --subcategory bioinformatics_pipeline_analysis \
+    --name run-2026-08-02 --payload payload.json --queue pipeline
+```
+
+Wrap the worker-side body and the row follows the execution:
+
+```python
+from entitymodel.celery_tasks import entity_task
+
+@entity_task(celery_app, session_factory, name="myapp.run_pipeline")
+def run_pipeline(session, task, payload):
+    return {"output": "s3://..."}
+```
+
+```
+Queued --> Running --> Succeeded
+                   \-> Retrying --> Running
+                   \-> Failed
+```
+
+Every transition goes through `fire_event`, so the whole history is in the event log and any
+handler can subscribe to it. A crash between the commit and the send leaves a Task in
+`Queued` that no worker will pick up; `pending_submissions()` finds those, because a Task
+that was never sent has no `celery_task_id`.
+
+## Managing workers
+
+```python
+WORKERS = {
+    "pipeline": {"queue": "pipeline", "concurrency": 4, "log_path": "logs/pipeline.log"},
+    "archive":  {"queue": "archive",  "concurrency": 1, "log_path": "logs/archive.log"},
+}
+```
+
+```bash
+python -m entitymodel.celery_workers --config myapp.conf:WORKERS --app myapp.celery:app
+python -m entitymodel.celery_workers --config myapp.conf:WORKERS --app myapp.celery:app --force
+python -m entitymodel.celery_workers --config myapp.conf:WORKERS --app myapp.celery:app --stop
+```
+
+Re-running is harmless: workers already up are skipped, since restarting would drop whatever
+they have in flight. `--force` stops them first. The script then supervises in the
+foreground, and **SIGTERM stops the workers it started** — which is why it does not detach:
+a detached fleet has nothing left to signal. Liveness comes from pid files, so a second
+invocation can see workers from a previous one without needing the broker; a pid file whose
+process is gone reads as "not running" and is cleaned up.
 
 ## Migrations
 

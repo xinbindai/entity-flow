@@ -5,6 +5,10 @@ description = "Entity-event-task model for a sequencing lab platform: a unified 
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    # 5.3.5 is the floor, not a preference: it is the first release that
+    # runs on Python 3.12. Earlier ones call entry_points().get(), which
+    # importlib.metadata dropped in 3.12, and crash on import.
+    "celery>=5.3.5",
     "psycopg2-binary>=2.9.12",
     "sqlalchemy>=2.0",
 ]
