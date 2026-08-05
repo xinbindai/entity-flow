@@ -42,7 +42,6 @@ from __future__ import annotations
 
 import argparse
 import functools
-import importlib
 import json
 import sys
 import uuid
@@ -52,6 +51,7 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from entitymodel.importing import import_attr
 from entitymodel.models import Task
 from entitymodel.outbox import fire_event
 
@@ -303,22 +303,6 @@ def _transition(
 # --------------------------------------------------------------------------
 # Command line
 # --------------------------------------------------------------------------
-def _import_attr(dotted: str):
-    """Import "package.module:attr" or "package.module.attr"."""
-    module_name, _, attr = dotted.partition(":")
-    if not attr:
-        module_name, _, attr = dotted.rpartition(".")
-    if not module_name or not attr:
-        raise SystemExit(f"expected module:attr or module.attr, got {dotted!r}")
-    try:
-        module = importlib.import_module(module_name)
-    except ImportError as exc:
-        raise SystemExit(f"cannot import {module_name!r}: {exc}") from exc
-    try:
-        return getattr(module, attr)
-    except AttributeError as exc:
-        raise SystemExit(f"{module_name!r} has no attribute {attr!r}") from exc
-
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
@@ -339,7 +323,10 @@ def main(argv: list[str] | None = None) -> int:
 
     from sqlalchemy import create_engine
 
-    celery_app = _import_attr(args.app)
+    try:
+        celery_app = import_attr(args.app)
+    except (ValueError, ImportError, AttributeError) as exc:
+        raise SystemExit(str(exc)) from exc
     payload = load_payload(args.payload)
     engine = create_engine(args.db_url)
 

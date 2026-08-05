@@ -119,6 +119,85 @@ def test_empty_name_is_rejected(session: Session) -> None:
 
 
 # --------------------------------------------------------------------------
+# Registering by dotted path, for configuration-driven deployments
+# --------------------------------------------------------------------------
+def test_register_accepts_a_dotted_path(session: Session) -> None:
+    registry = HandlerRegistry()
+    reg = registry.register(name="by-path", event_types=["A"],
+                            handle="handlers_fixture:record")
+
+    from handlers_fixture import record
+    assert reg.handle is record, "the path should resolve to the function itself"
+    assert reg.handle_ref == "handlers_fixture:record"
+
+
+def test_both_dotted_spellings_resolve(session: Session) -> None:
+    from handlers_fixture import record
+
+    # Both spellings: the colon form is unambiguous, the dotted form is what
+    # people usually type.
+    for spec in ("handlers_fixture:record", "handlers_fixture.record"):
+        registry = HandlerRegistry()
+        registry.register(name="h", event_types=["A"], handle=spec)
+        assert registry.get("h").handle is record, spec
+
+
+def test_a_directly_passed_callable_has_no_ref(session: Session) -> None:
+    registry = HandlerRegistry()
+    reg = registry.register(name="direct", event_types=["A"], handle=recorder([]))
+    assert reg.handle_ref is None, "handle_ref is for config-supplied handlers only"
+
+
+def test_a_dotted_handler_dispatches(session: Session) -> None:
+    """The resolved function must actually be the one that runs."""
+    import handlers_fixture
+
+    handlers_fixture.SEEN.clear()
+    task = make_task(session)
+    make_event(session, task, seq=0)
+
+    registry = HandlerRegistry()
+    registry.register(name="by-path", event_types=["AnalysisTaskSucceeded"],
+                      handle="handlers_fixture:record")
+
+    assert dispatch_once(session, registry) == 1
+    assert handlers_fixture.SEEN == [0], handlers_fixture.SEEN
+
+
+def test_a_bad_path_fails_at_registration_not_at_dispatch(session: Session) -> None:
+    """
+    A typo should stop the worker starting. Deferring it to first dispatch
+    means it surfaces hours later, looking like an event problem.
+    """
+    registry = HandlerRegistry()
+    for spec, fragment in [
+        ("no.such.module:thing", "cannot import"),
+        ("handlers_fixture:missing", "has no attribute"),
+        ("nocolonnodot", "module:attr or module.attr"),
+        ("", "expected a dotted path"),
+    ]:
+        try:
+            registry.register(name=f"bad-{spec}", event_types=["A"], handle=spec)
+        except ValueError as exc:
+            assert "bad-" in str(exc), f"the error should name the handler: {exc}"
+            assert fragment in str(exc), f"expected {fragment!r} in {exc}"
+        else:
+            raise AssertionError(f"expected {spec!r} to be rejected")
+    assert len(registry) == 0, "a failed registration should not be stored"
+
+
+def test_a_path_to_something_uncallable_is_rejected(session: Session) -> None:
+    registry = HandlerRegistry()
+    try:
+        registry.register(name="not-callable", event_types=["A"],
+                          handle="handlers_fixture:NOT_A_FUNCTION")
+    except ValueError as exc:
+        assert "not callable" in str(exc), exc
+    else:
+        raise AssertionError("expected a non-callable target to be rejected")
+
+
+# --------------------------------------------------------------------------
 # dispatch_once
 # --------------------------------------------------------------------------
 def test_dispatch_once_runs_every_handler(session: Session) -> None:
@@ -315,6 +394,12 @@ TESTS = [
     test_duplicate_name_is_rejected,
     test_empty_event_types_is_rejected,
     test_empty_name_is_rejected,
+    test_register_accepts_a_dotted_path,
+    test_both_dotted_spellings_resolve,
+    test_a_directly_passed_callable_has_no_ref,
+    test_a_dotted_handler_dispatches,
+    test_a_bad_path_fails_at_registration_not_at_dispatch,
+    test_a_path_to_something_uncallable_is_rejected,
     test_dispatch_once_runs_every_handler,
     test_dispatch_once_routes_by_event_type,
     test_dispatch_once_is_idempotent,

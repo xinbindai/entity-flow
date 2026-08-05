@@ -35,6 +35,7 @@ from sqlalchemy import delete, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
+from entitymodel.importing import import_attr
 from entitymodel.models import Entity, EventHandlerCheckpoint, EventHandlerFailure, EventRecord
 
 # A handler receives the open session and one event, and does its own writes
@@ -546,6 +547,10 @@ class Registration:
     name: str
     event_types: tuple[str, ...]
     handle: Handler
+    # The dotted path this handler was named by, when it came from
+    # configuration rather than a direct reference. Kept so a status dump or
+    # a log line can say which code a subscription resolved to.
+    handle_ref: str | None = None
     batch_size: int = 100
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
     backoff_seconds: float = DEFAULT_BACKOFF_SECONDS
@@ -577,7 +582,7 @@ class HandlerRegistry:
         *,
         name: str,
         event_types: Sequence[str],
-        handle: Handler,
+        handle: Handler | str,
         batch_size: int = 100,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         backoff_seconds: float = DEFAULT_BACKOFF_SECONDS,
@@ -589,6 +594,13 @@ class HandlerRegistry:
         checkpoint ledger and each would mark the other's events processed,
         and deriving it from `handle.__name__` would turn an ordinary Python
         rename into a silent full replay.
+
+        `handle` may be the callable itself, or a dotted path naming it
+        ("myapp.handlers:create_sample_result"), so a deployment can list its
+        subscriptions in configuration. A path is resolved here, at
+        registration, not at first dispatch -- a typo should stop the worker
+        starting rather than surface hours later when a matching event finally
+        arrives, by which time it looks like an event problem.
         """
         if not name:
             raise ValueError("handler name is required -- it is the checkpoint key")
@@ -600,10 +612,21 @@ class HandlerRegistry:
         if not event_types:
             raise ValueError(f"handler {name!r} subscribes to no event types")
 
+        handle_ref = handle if isinstance(handle, str) else None
+        if handle_ref is not None:
+            try:
+                handle = import_attr(handle_ref)
+            except (ValueError, ImportError, AttributeError) as exc:
+                raise ValueError(f"handler {name!r}: {exc}") from exc
+        if not callable(handle):
+            what = handle_ref or type(handle).__name__
+            raise ValueError(f"handler {name!r}: {what} is not callable")
+
         registration = Registration(
             name=name,
             event_types=tuple(event_types),
             handle=handle,
+            handle_ref=handle_ref,
             batch_size=batch_size,
             max_attempts=max_attempts,
             backoff_seconds=backoff_seconds,

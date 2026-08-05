@@ -40,6 +40,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from entitymodel.importing import import_attr
+
 __all__ = ["WorkerFleet", "WorkerSpec", "load_specs"]
 
 # How long to wait for a worker to exit after SIGTERM before SIGKILL. Celery
@@ -325,22 +327,6 @@ class WorkerFleet:
 # --------------------------------------------------------------------------
 # Command line: the init script itself.
 # --------------------------------------------------------------------------
-def _import_attr(dotted: str):
-    """Import "package.module:attr" or "package.module.attr"."""
-    import importlib
-
-    module_name, _, attr = dotted.partition(":")
-    if not attr:
-        module_name, _, attr = dotted.rpartition(".")
-    if not module_name or not attr:
-        raise SystemExit(f"expected module:attr or module.attr, got {dotted!r}")
-    try:
-        return getattr(importlib.import_module(module_name), attr)
-    except ImportError as exc:
-        raise SystemExit(f"cannot import {module_name!r}: {exc}") from exc
-    except AttributeError as exc:
-        raise SystemExit(f"{module_name!r} has no attribute {attr!r}") from exc
-
 
 def main(argv: list[str] | None = None) -> int:
     import argparse
@@ -364,8 +350,13 @@ def main(argv: list[str] | None = None) -> int:
                         help="seconds to wait for warm shutdown before SIGKILL")
     args = parser.parse_args(argv)
 
+    try:
+        config = import_attr(args.config)
+    except (ValueError, ImportError, AttributeError) as exc:
+        raise SystemExit(str(exc)) from exc
+
     fleet = WorkerFleet(
-        _import_attr(args.config),
+        config,
         app=args.app,
         state_dir=args.state_dir,
         stop_timeout=args.stop_timeout,
