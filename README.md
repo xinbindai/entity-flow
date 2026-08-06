@@ -233,6 +233,49 @@ handler can subscribe to it. A crash between the commit and the send leaves a Ta
 `Queued` that no worker will pick up; `pending_submissions()` finds those, because a Task
 that was never sent has no `celery_task_id`.
 
+## Troubleshooting a handler
+
+`entitymodel.outbox` logs its dispatch decisions at DEBUG. Turning them on takes two steps,
+and doing only the second is the usual mistake — a record has to pass the logger's level
+**and** reach a handler:
+
+```python
+import logging
+
+logging.basicConfig(level=logging.INFO)                            # 1. somewhere to go
+logging.getLogger("entitymodel.outbox").setLevel(logging.DEBUG)    # 2. the level
+```
+
+That way round keeps the detail to this module. `basicConfig(level=logging.DEBUG)` works
+too, but also turns on every SQL statement SQLAlchemy emits.
+
+```
+my-handler: polled ['AnalysisTaskSucceeded'] -> 1 candidate(s) (batch_size=100, max_attempts=5)
+my-handler: dispatching event 3a947502-… (AnalysisTaskSucceeded)
+my-handler: event 3a947502-… handled and checkpointed
+```
+
+The message worth knowing about is the one for a poll that found nothing, since "my handler
+isn't running" is the usual complaint and the reason is otherwise invisible — the query
+excludes rows silently:
+
+```
+my-handler: nothing to do because no events of type ['Nope'] exist yet
+my-handler: nothing to do because of 2 event(s): 2 already processed, 0 dead-lettered, 0 backing off
+my-handler: nothing to do because of 2 event(s): 0 already processed, 0 dead-lettered, 2 backing off
+my-handler: nothing to do because of 2 event(s): 0 already processed, 2 dead-lettered, 0 backing off
+```
+
+That explanation costs an extra query, so it only runs when DEBUG is actually enabled.
+
+Dead-lettering logs at **WARNING**, not DEBUG — an event nobody will retry, dropped with no
+signal, is the failure that costs most to find late:
+
+```
+WARNING  my-handler: event af7c41e7-… dead-lettered after 5 attempt(s); last error
+         RuntimeError: disk on fire. It will not be retried -- see dead_lettered() and replay()
+```
+
 ## Managing workers
 
 ```python

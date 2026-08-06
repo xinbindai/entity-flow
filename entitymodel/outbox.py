@@ -24,6 +24,7 @@ See demo.py for a worked example and test/ for the behaviour they guarantee.
 from __future__ import annotations
 
 import hashlib
+import logging
 import threading
 import time
 import uuid
@@ -43,6 +44,26 @@ from entitymodel.models import Entity, EventHandlerCheckpoint, EventHandlerFailu
 # handler's writes together with the checkpoint row, which is what makes the
 # pair atomic.
 Handler = Callable[[Session, EventRecord], None]
+
+# Nothing is configured here. A library that calls basicConfig() decides where
+# the whole application's logs go, which is not its call to make.
+#
+# Turning these on takes two steps, and doing only the second is the usual
+# mistake -- a record has to pass this logger's level AND reach a handler, and
+# setLevel alone gives it nowhere to go:
+#
+#     import logging
+#     logging.basicConfig(level=logging.INFO)                     # 1. a handler
+#     logging.getLogger("entitymodel.outbox").setLevel(logging.DEBUG)   # 2. the level
+#
+# Done that way round the debug detail is limited to this module, rather than
+# also turning on every SQL statement SQLAlchemy emits. basicConfig(DEBUG)
+# alone works too, and is much noisier.
+#
+# Messages carry handler_name and event_id so a single event can be followed
+# end to end with grep. All arguments are passed lazily, so a disabled DEBUG
+# level costs one comparison rather than a format.
+log = logging.getLogger(__name__)
 
 # How many consecutive failures before poll_and_dispatch stops selecting an
 # event for a handler. Past this the event is dead-lettered: it sits in
@@ -234,11 +255,72 @@ def poll_and_dispatch(
         .limit(batch_size)
     ).all()
 
+    # The candidate count is the first thing worth knowing: zero means the
+    # query excluded everything -- already checkpointed, dead-lettered, backed
+    # off, or simply no event of these types -- rather than the handler
+    # failing.
+    log.debug(
+        "%s: polled %s -> %d candidate(s) (batch_size=%d, max_attempts=%d)",
+        handler_name, event_types, len(pending), batch_size, max_attempts,
+    )
+    # "Nothing was dispatched" is the usual complaint, and the reason lives in
+    # the anti-joins above, which exclude rows silently. Break the exclusion
+    # down -- but only when the answer will actually be logged, since this is
+    # a second query.
+    if not pending and log.isEnabledFor(logging.DEBUG):
+        log.debug("%s: nothing to do because %s", handler_name,
+                  _explain_empty_poll(session, handler_name, event_types, max_attempts))
+
     return _dispatch(
         session, handler_name, pending, handle,
         overwrite_checkpoint=False, record_failures=True, claim="try",
         max_attempts=max_attempts,
         backoff_seconds=backoff_seconds, max_backoff_seconds=max_backoff_seconds,
+    )
+
+
+def _explain_empty_poll(
+    session: Session, handler_name: str, event_types: list[str], max_attempts: int
+) -> str:
+    """
+    Why a poll found no candidates: no such events at all, or every one of
+    them already accounted for by this handler. Debug-only, so the extra
+    round trip is paid only by someone who is watching.
+    """
+    total = session.scalar(
+        select(func.count()).select_from(EventRecord)
+        .where(EventRecord.event_type.in_(event_types))
+    )
+    if not total:
+        return f"no events of type {event_types} exist yet"
+
+    processed = session.scalar(
+        select(func.count()).select_from(EventHandlerCheckpoint)
+        .join(EventRecord, EventRecord.event_id == EventHandlerCheckpoint.event_id)
+        .where(
+            EventHandlerCheckpoint.handler_name == handler_name,
+            EventRecord.event_type.in_(event_types),
+        )
+    )
+    dead, waiting = session.execute(
+        select(
+            func.count().filter(EventHandlerFailure.attempts >= max_attempts),
+            func.count().filter(
+                EventHandlerFailure.attempts < max_attempts,
+                EventHandlerFailure.next_attempt_at > func.statement_timestamp(),
+            ),
+        )
+        .select_from(EventHandlerFailure)
+        .join(EventRecord, EventRecord.event_id == EventHandlerFailure.event_id)
+        .where(
+            EventHandlerFailure.handler_name == handler_name,
+            EventRecord.event_type.in_(event_types),
+        )
+    ).one()
+
+    return (
+        f"of {total} event(s) of type {event_types}: {processed} already processed, "
+        f"{dead} dead-lettered, {waiting} backing off"
     )
 
 
@@ -291,36 +373,50 @@ def _lock_key(handler_name: str, event_id: uuid.UUID) -> int:
     return int.from_bytes(digest, "big", signed=True)
 
 
-def _settled(session: Session, handler_name: str, event_id: uuid.UUID, max_attempts: int) -> bool:
+def _settled(
+    session: Session, handler_name: str, event_id: uuid.UUID, max_attempts: int
+) -> str | None:
     """
-    Has another worker finished (or given up on) this event since we selected
-    it? Must run as its own statement *after* the claim is held: under READ
+    Why this event should be skipped now, or None to go ahead.
+
+    Returns a reason rather than a bool so the debug log can answer the
+    question people actually ask when a handler seems not to run -- "why was
+    it skipped" -- without a second round trip to find out.
+
+    Must run as its own statement *after* the claim is held: under READ
     COMMITTED each statement takes a fresh snapshot, so folding this into the
     same SELECT as the lock would test a snapshot taken before the lock was
     acquired and reintroduce the race it exists to close.
     """
-    return bool(
-        session.scalar(
-            select(
-                select(EventHandlerCheckpoint.event_id)
-                .where(
-                    EventHandlerCheckpoint.handler_name == handler_name,
-                    EventHandlerCheckpoint.event_id == event_id,
-                )
-                .exists()
-                | select(EventHandlerFailure.event_id)
-                .where(
-                    EventHandlerFailure.handler_name == handler_name,
-                    EventHandlerFailure.event_id == event_id,
-                    or_(
-                        EventHandlerFailure.attempts >= max_attempts,
-                        EventHandlerFailure.next_attempt_at > func.statement_timestamp(),
-                    ),
-                )
-                .exists()
-            )
-        )
+    mine = (
+        EventHandlerFailure.handler_name == handler_name,
+        EventHandlerFailure.event_id == event_id,
     )
+    row = session.execute(
+        select(
+            select(EventHandlerCheckpoint.event_id)
+            .where(
+                EventHandlerCheckpoint.handler_name == handler_name,
+                EventHandlerCheckpoint.event_id == event_id,
+            )
+            .exists()
+            .label("processed"),
+            select(EventHandlerFailure.attempts).where(*mine).scalar_subquery().label("attempts"),
+            select(EventHandlerFailure.next_attempt_at)
+            .where(*mine)
+            .scalar_subquery()
+            .label("next_attempt_at"),
+            func.statement_timestamp().label("now"),
+        )
+    ).one()
+
+    if row.processed:
+        return "already processed by this handler"
+    if row.attempts is not None and row.attempts >= max_attempts:
+        return f"dead-lettered after {row.attempts} attempt(s)"
+    if row.next_attempt_at is not None and row.next_attempt_at > row.now:
+        return f"backing off until {row.next_attempt_at.isoformat()}"
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -352,6 +448,8 @@ def _dispatch(
 ) -> int:
     succeeded = 0
 
+    log.debug("%s: %d event(s) to dispatch", handler_name, len(events))
+
     for ev in events:
         # Captured before dispatch: a rollback expires `ev`, and reading the
         # attribute afterwards would cost an extra round trip.
@@ -362,16 +460,25 @@ def _dispatch(
             if not session.scalar(select(func.pg_try_advisory_xact_lock(key))):
                 # Another worker holds this (handler, event). It is theirs to
                 # finish; we move on rather than block the rest of the batch.
+                log.debug(
+                    "%s: skipping event %s -- claimed by another worker",
+                    handler_name, event_id,
+                )
                 session.rollback()
                 continue
-            if _settled(session, handler_name, event_id, max_attempts):
-                # They finished it between our SELECT and our claim.
+            reason = _settled(session, handler_name, event_id, max_attempts)
+            if reason is not None:
+                # Something changed between our SELECT and our claim.
+                log.debug("%s: skipping event %s -- %s", handler_name, event_id, reason)
                 session.rollback()
                 continue
         else:
             session.execute(select(func.pg_advisory_xact_lock(key)))
 
         try:
+            log.debug(
+                "%s: dispatching event %s (%s)", handler_name, event_id, ev.event_type
+            )
             handle(session, ev)
             if overwrite_checkpoint:
                 session.execute(
@@ -397,15 +504,21 @@ def _dispatch(
             )
             session.commit()
             succeeded += 1
+            log.debug("%s: event %s handled and checkpointed", handler_name, event_id)
         except Exception as exc:
             # Discard the handler's partial writes. This also leaves any
             # pre-existing checkpoint intact, so a failed dispatch can't make
             # a processed event look unprocessed.
             session.rollback()
+            log.debug(
+                "%s: event %s raised %s: %s",
+                handler_name, event_id, type(exc).__name__, exc,
+            )
             if not record_failures:
                 raise
             _record_failure(
                 session, handler_name, event_id, exc,
+                max_attempts=max_attempts,
                 backoff_seconds=backoff_seconds, max_backoff_seconds=max_backoff_seconds,
             )
 
@@ -433,6 +546,7 @@ def _record_failure(
     event_id: uuid.UUID,
     exc: BaseException,
     *,
+    max_attempts: int,
     backoff_seconds: float,
     max_backoff_seconds: float,
 ) -> None:
@@ -441,7 +555,7 @@ def _record_failure(
     whatever the handler did."""
     message = f"{type(exc).__name__}: {exc}"[:_MAX_ERROR_CHARS]
     failures = EventHandlerFailure.__table__
-    session.execute(
+    stmt = (
         pg_insert(EventHandlerFailure)
         .values(
             handler_name=handler_name,
@@ -461,8 +575,25 @@ def _record_failure(
                 ),
             },
         )
+        .returning(EventHandlerFailure.attempts, EventHandlerFailure.next_attempt_at)
     )
+    attempts, next_attempt_at = session.execute(stmt).one()
     session.commit()
+
+    if attempts >= max_attempts:
+        # Not debug. An event nobody will retry, dropped without anyone being
+        # told, is the failure mode that costs the most to discover late.
+        log.warning(
+            "%s: event %s dead-lettered after %d attempt(s); "
+            "last error %s. It will not be retried -- see dead_lettered() and replay()",
+            handler_name, event_id, attempts, message,
+        )
+    else:
+        log.debug(
+            "%s: event %s failed (attempt %d of %d), next attempt at %s",
+            handler_name, event_id, attempts, max_attempts,
+            next_attempt_at.isoformat() if next_attempt_at else "unknown",
+        )
 
 
 # --------------------------------------------------------------------------
@@ -522,6 +653,9 @@ def replay(
     missing = set(event_ids) - {ev.event_id for ev in events}
     if missing:
         raise ValueError(f"no such event(s): {sorted(str(m) for m in missing)}")
+
+    log.debug("%s: replaying %d event(s): %s",
+              handler_name, len(events), [str(ev.event_id) for ev in events])
 
     return _dispatch(
         session, handler_name, events, handle,
@@ -633,6 +767,11 @@ class HandlerRegistry:
             max_backoff_seconds=max_backoff_seconds,
         )
         self._registrations[name] = registration
+        log.debug(
+            "registered handler %r for %s -> %s",
+            name, list(registration.event_types),
+            handle_ref or getattr(handle, "__qualname__", repr(handle)),
+        )
         return registration
 
     def on(self, *event_types: str, name: str, **kwargs) -> Callable[[Handler], Handler]:
@@ -673,8 +812,9 @@ def dispatch_once(session: Session, registry: HandlerRegistry) -> int:
     Handler errors are recorded against the event rather than raised (see
     poll_and_dispatch), so one broken handler doesn't stop the others.
     """
-    return sum(
-        poll_and_dispatch(
+    total = 0
+    for reg in registry:
+        total += poll_and_dispatch(
             session,
             handler_name=reg.name,
             event_types=list(reg.event_types),
@@ -684,8 +824,9 @@ def dispatch_once(session: Session, registry: HandlerRegistry) -> int:
             backoff_seconds=reg.backoff_seconds,
             max_backoff_seconds=reg.max_backoff_seconds,
         )
-        for reg in registry
-    )
+
+    log.debug("dispatch pass over %d handler(s) dispatched %d event(s)", len(registry), total)
+    return total
 
 
 def listen(
@@ -721,6 +862,10 @@ def listen(
     """
     total = 0
     cycles = 0
+    log.debug(
+        "listening with %d handler(s): %s (poll_interval=%.3gs)",
+        len(registry), registry.names(), poll_interval,
+    )
 
     try:
         while not (stop is not None and stop.is_set()):
@@ -734,6 +879,7 @@ def listen(
             cycles += 1
 
             if dispatched == 0:
+                log.debug("cycle %d idle, sleeping %.3gs", cycles, poll_interval)
                 if stop is not None:
                     if stop.wait(poll_interval):
                         break
