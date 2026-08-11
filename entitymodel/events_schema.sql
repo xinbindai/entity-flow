@@ -75,6 +75,9 @@ CREATE TABLE event_handler_checkpoints (
     handler_name     TEXT NOT NULL,               -- e.g. 'create-pipeline-task-on-sequencing-ready'
     event_id         UUID NOT NULL REFERENCES events(event_id),
     processed_at     TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    -- NULL when the handler did the work; set when it declined the event.
+    -- Both settle the event, so without this the two are indistinguishable.
+    cancelled_reason TEXT,
     PRIMARY KEY (handler_name, event_id)
 );
 

@@ -45,6 +45,33 @@ from entitymodel.models import Entity, EventHandlerCheckpoint, EventHandlerFailu
 # pair atomic.
 Handler = Callable[[Session, EventRecord], None]
 
+
+class HandlerCancelled(Exception):
+    """
+    Raised by a handler to decline an event for good: it will not be retried.
+
+    A handler that has nothing to do with an event -- a rule that no longer
+    applies, a record superseded before the handler reached it, work another
+    system already did -- has not failed, and retrying it four more times with
+    backoff before dead-lettering it is wasted effort that ends in a warning
+    nobody should act on.
+
+    Cancelling settles the event exactly as success does: a checkpoint is
+    written, any failure history is cleared, and the handler is never offered
+    it again. What differs is only the log line. The handler's own writes are
+    rolled back first, on the grounds that a handler which declined an event
+    should not leave half its work behind; do the work or decline, not both.
+
+        def handle(session, ev):
+            if ev.payload["assay"] != "CGP":
+                raise HandlerCancelled("not a CGP order")
+            ...
+
+    Subclass it for a reason worth distinguishing in logs; the message is
+    otherwise the whole record of why. replay() runs a cancelled event again,
+    which is the way back if the decision was wrong.
+    """
+
 # Nothing is configured here. A library that calls basicConfig() decides where
 # the whole application's logs go, which is not its call to make.
 #
@@ -85,6 +112,7 @@ __all__ = [
     "DEFAULT_MAX_ATTEMPTS",
     "DEFAULT_MAX_BACKOFF_SECONDS",
     "Handler",
+    "HandlerCancelled",
     "HandlerRegistry",
     "Registration",
     "dead_lettered",
@@ -188,11 +216,12 @@ def poll_and_dispatch(
     has neither checkpointed nor dead-lettered, and whose retry backoff (if
     any) has elapsed -- oldest first.
 
-    Returns how many were dispatched *successfully*. A handler that raises
-    does not abort the batch: the failure is recorded against that event and
-    the loop moves on, so one poison event can't block the queue. Because
-    failures aren't counted in the return value, a drain loop -- call until it
-    returns 0 -- exits instead of spinning on events that keep failing.
+    Returns how many events were settled: handled successfully, or declined by
+    the handler raising HandlerCancelled. A handler that raises anything else
+    does not abort the batch -- the failure is recorded against that event and
+    the loop moves on, so one poison event can't block the queue. Failures are
+    deliberately not counted, so a drain loop -- call until it returns 0 --
+    exits instead of spinning on events that keep failing.
 
     A failed event is held back for backoff_seconds * 2**(attempts-1), capped
     at max_backoff_seconds, so retries spread out instead of firing on every
@@ -447,6 +476,7 @@ def _dispatch(
     max_backoff_seconds: float = DEFAULT_MAX_BACKOFF_SECONDS,
 ) -> int:
     succeeded = 0
+    settled = 0  # cancelled by the handler: finished with, but no work done
 
     log.debug("%s: %d event(s) to dispatch", handler_name, len(events))
 
@@ -480,31 +510,25 @@ def _dispatch(
                 "%s: dispatching event %s (%s)", handler_name, event_id, ev.event_type
             )
             handle(session, ev)
-            if overwrite_checkpoint:
-                session.execute(
-                    pg_insert(EventHandlerCheckpoint)
-                    .values(handler_name=handler_name, event_id=event_id)
-                    .on_conflict_do_update(
-                        index_elements=["handler_name", "event_id"],
-                        set_={"processed_at": func.clock_timestamp()},
-                    )
-                )
-            else:
-                session.add(
-                    EventHandlerCheckpoint(handler_name=handler_name, event_id=event_id)
-                )
-            # Success clears any failure history, so `attempts` always counts
-            # consecutive failures rather than lifetime ones. Same transaction
-            # as the checkpoint, so the two can't disagree.
-            session.execute(
-                delete(EventHandlerFailure).where(
-                    EventHandlerFailure.handler_name == handler_name,
-                    EventHandlerFailure.event_id == event_id,
-                )
-            )
+            _settle(session, handler_name, event_id, overwrite=overwrite_checkpoint)
             session.commit()
             succeeded += 1
             log.debug("%s: event %s handled and checkpointed", handler_name, event_id)
+        except HandlerCancelled as exc:
+            # Not a failure: the handler decided this event is not its
+            # business. Roll its partial work back, then settle the event so
+            # nothing offers it again.
+            session.rollback()
+            _settle(
+                session, handler_name, event_id, overwrite=overwrite_checkpoint,
+                cancelled_reason=(str(exc) or type(exc).__name__)[:_MAX_ERROR_CHARS],
+            )
+            session.commit()
+            settled += 1
+            log.info(
+                "%s: event %s cancelled by the handler -- %s. It will not be retried",
+                handler_name, event_id, exc or "no reason given",
+            )
         except Exception as exc:
             # Discard the handler's partial writes. This also leaves any
             # pre-existing checkpoint intact, so a failed dispatch can't make
@@ -522,7 +546,69 @@ def _dispatch(
                 backoff_seconds=backoff_seconds, max_backoff_seconds=max_backoff_seconds,
             )
 
-    return succeeded
+    log.debug(
+        "%s: %d of %d event(s) succeeded, %d cancelled",
+        handler_name, succeeded, len(events), settled,
+    )
+    # Cancelled events count towards the return value even though no work was
+    # done. The number drives the drain loop, which needs to know whether the
+    # pass made progress, and settling events it will never see again is
+    # progress.
+    return succeeded + settled
+
+
+def _settle(
+    session: Session,
+    handler_name: str,
+    event_id: uuid.UUID,
+    *,
+    overwrite: bool,
+    cancelled_reason: str | None = None,
+) -> None:
+    """
+    Mark this (handler, event) finished: checkpoint it and drop any failure
+    history, so `attempts` always counts *consecutive* failures. Both writes
+    go in the caller's transaction, so the two can never disagree.
+
+    cancelled_reason is None when the handler did the work and set when it
+    declined. On the upsert path it is written unconditionally rather than
+    only when set, so replaying a cancelled event and succeeding clears the
+    old reason instead of leaving a checkpoint that claims to be both.
+
+    See poll_and_dispatch for why the plain INSERT is right there and the
+    upsert is right for replay.
+    """
+    if overwrite:
+        session.execute(
+            pg_insert(EventHandlerCheckpoint)
+            .values(
+                handler_name=handler_name,
+                event_id=event_id,
+                cancelled_reason=cancelled_reason,
+            )
+            .on_conflict_do_update(
+                index_elements=["handler_name", "event_id"],
+                set_={
+                    "processed_at": func.clock_timestamp(),
+                    "cancelled_reason": cancelled_reason,
+                },
+            )
+        )
+    else:
+        session.add(
+            EventHandlerCheckpoint(
+                handler_name=handler_name,
+                event_id=event_id,
+                cancelled_reason=cancelled_reason,
+            )
+        )
+
+    session.execute(
+        delete(EventHandlerFailure).where(
+            EventHandlerFailure.handler_name == handler_name,
+            EventHandlerFailure.event_id == event_id,
+        )
+    )
 
 
 def _backoff_interval(attempts_before: int | object, base: float, cap: float):
@@ -627,6 +713,10 @@ def replay(
     Unlike poll_and_dispatch, a handler error propagates rather than being
     counted -- replay is operator-invoked, so the error should surface. A
     successful dispatch clears any failure history for that (handler, event).
+
+    HandlerCancelled is the exception to that: a handler declining an event is
+    an answer, not an error, so it is settled and logged here exactly as it
+    would be during a poll rather than raised at the operator.
 
     Also unlike poll_and_dispatch, this waits for each event's claim instead
     of skipping it: if a worker is mid-dispatch on the same event, replay

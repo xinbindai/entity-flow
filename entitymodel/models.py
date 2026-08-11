@@ -314,6 +314,12 @@ class EventHandlerCheckpoint(Base):
     processed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.clock_timestamp()
     )
+    # NULL when the handler did the work; set when it declined the event by
+    # raising HandlerCancelled. Both outcomes settle the event and stop it
+    # being offered again, so without this the two are indistinguishable
+    # afterwards -- and "why did nothing happen for this order" is exactly the
+    # question someone asks months later.
+    cancelled_reason: Mapped[str | None] = mapped_column(Text)
 
 
 class EventHandlerFailure(Base):
