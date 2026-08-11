@@ -141,6 +141,7 @@ def fire_event(
     actor_id: str | None = None,
     causation_type: str | None = None,
     causation_id: uuid.UUID | None = None,
+    trace_id: str | None = None,
     occurred_at: datetime | None = None,
 ) -> EventRecord:
     """
@@ -159,6 +160,18 @@ def fire_event(
     commit at T+30s, and rows only become visible at commit. So don't use
     either timestamp as a consumption cursor -- drain on published_at IS NULL
     with FOR UPDATE SKIP LOCKED instead.
+
+    trace_id is the ephemeral handle for the inbound call that set all this
+    off -- an API request id, or a W3C traceparent trace-id -- and is the one
+    field here worth passing on unchanged. A handler reacting to an event
+    should forward `ev.trace_id`, so everything one request causes can be
+    lined up against that request's logs. It is not a domain fact and will
+    outlive nothing: the logs it points at are rotated away long before the
+    events are. Keep durable provenance in actor_id and correlation_id.
+
+    Note it is not inherited automatically. fire_event has no reference to the
+    causing event -- only its id -- and looking one up behind the caller's
+    back to copy a debugging field would be a poor trade.
     """
     entity.status = new_status
     ev = EventRecord(
@@ -168,6 +181,7 @@ def fire_event(
         correlation_id=entity.correlation_id or uuid.uuid4(),
         causation_type=causation_type,
         causation_id=causation_id,
+        trace_id=trace_id,
         source=source,
         actor_type=actor_type,
         actor_id=actor_id,

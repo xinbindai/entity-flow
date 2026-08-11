@@ -74,6 +74,9 @@ def create_sample_result_on_analysis_succeeded(session: Session, ev: EventRecord
         actor_type="system",
         causation_type="event",
         causation_id=ev.event_id,
+        # Forwarded, not regenerated: everything this request set off should
+        # line up against that one request in the logs.
+        trace_id=ev.trace_id,
     )
     print(f"  -> created Result {result.name!r} (id={result.id}), emitted SampleResultCreated")
 

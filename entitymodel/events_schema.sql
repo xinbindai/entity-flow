@@ -62,6 +62,8 @@ CREATE INDEX idx_events_correlation_id  ON events (correlation_id);
 CREATE INDEX idx_events_entity          ON events (entity_type, entity_id);
 CREATE INDEX idx_events_causation       ON events (causation_type, causation_id);
 CREATE INDEX idx_events_type_occurred   ON events (event_type, occurred_at);
+-- Partial: most events have no inbound request behind them.
+CREATE INDEX idx_events_trace          ON events (trace_id) WHERE trace_id IS NOT NULL;
 CREATE INDEX idx_events_unpublished     ON events (published_at) WHERE published_at IS NULL;
 
 -- Optional at scale: partition by month on occurred_at for retention

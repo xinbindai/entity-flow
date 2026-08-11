@@ -241,6 +241,15 @@ class EventRecord(Base):
         Index("idx_events_entity", "entity_type", "entity_id"),
         Index("idx_events_causation", "causation_type", "causation_id"),
         Index("idx_events_type_occurred", "event_type", "occurred_at"),
+        # Partial: most events have no inbound request behind them -- cron
+        # jobs, and every event a handler emits without forwarding one. This
+        # covers "everything that request caused", which is the only question
+        # trace_id is for.
+        Index(
+            "idx_events_trace",
+            "trace_id",
+            postgresql_where=text("trace_id IS NOT NULL"),
+        ),
         # Partial index, present in events_schema.sql but previously missing
         # here: it covers only unpublished rows, so the relay's hot path stays
         # small no matter how large the events table grows.

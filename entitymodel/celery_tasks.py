@@ -117,6 +117,7 @@ def submit_task(
     correlation_id: uuid.UUID | None = None,
     causation_type: str | None = None,
     causation_id: uuid.UUID | None = None,
+    trace_id: str | None = None,
     statuses: TaskStatuses = DEFAULT_STATUSES,
     event_type: str = "TaskQueued",
 ) -> Task:
@@ -133,7 +134,11 @@ def submit_task(
         name=name,
         status=statuses.queued,
         correlation_id=correlation_id or uuid.uuid4(),
-        attributes={"payload": payload, "retry_count": 0},
+        # trace_id is kept on the Task as well as on the event so the worker
+        # can carry it into TaskStarted/Succeeded/Failed without a lookup. The
+        # worker runs in a different process minutes later; the alternative is
+        # a query per transition to find the event that queued it.
+        attributes={"payload": payload, "retry_count": 0, "trace_id": trace_id},
     )
     session.add(task)
     session.flush()  # need task.id before the event can reference it
@@ -149,6 +154,7 @@ def submit_task(
         actor_id=actor_id,
         causation_type=causation_type,
         causation_id=causation_id,
+        trace_id=trace_id,
     )
     session.commit()
 
@@ -296,6 +302,9 @@ def _transition(
         payload=payload,
         source="celery-worker",
         actor_type="worker",
+        # Carried from submission, so the whole execution lines up against the
+        # request that asked for it.
+        trace_id=task.attributes.get("trace_id"),
     )
     session.commit()
 

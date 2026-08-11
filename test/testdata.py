@@ -117,6 +117,7 @@ def make_event(
     seq: int = 0,
     sample_id: str | None = None,
     occurred_at: datetime | None = None,
+    trace_id: str | None = None,
     commit: bool = True,
 ) -> EventRecord:
     """
@@ -141,6 +142,7 @@ def make_event(
             "seq": seq,
         },
         occurred_at=occurred_at or (BASE_TIME + timedelta(seconds=seq)),
+        trace_id=trace_id,
     )
     session.add(ev)
     if commit:
