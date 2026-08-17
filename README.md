@@ -9,7 +9,7 @@ are written in one transaction (the **transactional outbox** pattern), and consu
 what they've handled per-handler, so redelivery and replay are safe.
 
 The full design, including the alternative schema that was evaluated and rejected, is in
-[entity-event-task-architecture.md](entity-event-task-architecture.md).
+[entity-event-task-architecture.md](https://github.com/xinbindai/entity-flow/blob/main/entity-event-task-architecture.md).
 
 ## Layout
 
@@ -102,7 +102,7 @@ python taxonomy.py postgresql+psycopg2://localhost/lab   # once: create schema +
 python demo.py     postgresql+psycopg2://localhost/lab --worker
 ```
 
-`run_worker` in [demo.py](demo.py) is the shape you would deploy: a session factory, the
+`run_worker` in [demo.py](https://github.com/xinbindai/entity-flow/blob/main/demo.py) is the shape you would deploy: a session factory, the
 registry, and `listen()` looping until SIGTERM. Several copies can run against the same
 database — each event is claimed before its handler runs, so workers skip what another is
 already doing rather than duplicating it.

@@ -1,9 +1,24 @@
 [project]
 name = "entity-flow"
-version = "0.3.0"
+version = "0.3.1"
 description = "Entity-event-task model for a sequencing lab platform: a unified polymorphic entity schema plus transactional-outbox event machinery"
 readme = "README.md"
 requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Xinbin Dai", email = "daixinbin@gmail.com" }]
+# Only 3.12 is claimed: it is the floor requires-python sets and the only
+# version the suite runs against. Listing 3.13 would be a guess.
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Healthcare Industry",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
 dependencies = [
     # 5.3.5 is the floor, not a preference: it is the first release that
     # runs on Python 3.12. Earlier ones call entry_points().get(), which
@@ -12,6 +27,12 @@ dependencies = [
     "psycopg2-binary>=2.9.12",
     "sqlalchemy>=2.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/xinbindai/entity-flow"
+Repository = "https://github.com/xinbindai/entity-flow"
+Issues = "https://github.com/xinbindai/entity-flow/issues"
+Changelog = "https://github.com/xinbindai/entity-flow/releases"
 
 [build-system]
 requires = ["hatchling"]
