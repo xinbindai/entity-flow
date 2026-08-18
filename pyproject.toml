@@ -1,6 +1,6 @@
 [project]
 name = "entity-flow"
-version = "0.4.0"
+version = "0.4.1"
 description = "Entity-event-task model for a sequencing lab platform: a unified polymorphic entity schema plus transactional-outbox event machinery"
 readme = "README.md"
 requires-python = ">=3.12"
