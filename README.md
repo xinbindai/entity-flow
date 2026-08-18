@@ -25,7 +25,7 @@ The full design, including the alternative schema that was evaluated and rejecte
 | `taxonomy.py` | **This** lab's categories — the taxonomy CSVs plus the `Patient`/`Sample`/… subclasses. Another deployment replaces this file. |
 | `entity_types.csv`, `entity_statuses.csv` | The taxonomy itself — editable without touching Python |
 | `demo.py` | A worked example: one handler, a scripted walkthrough, and a runnable worker |
-| `test/` | Ten suites, 123 tests, run against a real PostgreSQL |
+| `test/` | Fourteen suites, 180 tests, run against a real PostgreSQL |
 | `migrations/` | Alembic revisions; `alembic.ini` at the root |
 
 ## Setup
@@ -132,16 +132,20 @@ for f in test/test_*.py; do python "$f"; done
 ```
 
 ```
-test/test_concurrency.py          5 passed
-test/test_dispatch_retry.py      16 passed
-test/test_entity_subclasses.py    7 passed
-test/test_event_timing.py        14 passed
-test/test_poll_and_dispatch.py    8 passed
-test/test_registry.py            15 passed
-test/test_replay.py               9 passed
-test/test_taxonomy_sync.py       17 passed
-test/test_celery_tasks.py        17 passed
-test/test_celery_workers.py      15 passed
+test/test_cancelled.py             18 passed
+test/test_celery_tasks.py          17 passed
+test/test_celery_workers.py        15 passed
+test/test_concurrency.py           5 passed
+test/test_dispatch_retry.py        16 passed
+test/test_entity_subclasses.py     7 passed
+test/test_event_timing.py          14 passed
+test/test_importing.py             9 passed
+test/test_logging.py               13 passed
+test/test_poll_and_dispatch.py     8 passed
+test/test_registry.py              21 passed
+test/test_replay.py                9 passed
+test/test_taxonomy_sync.py         17 passed
+test/test_trace_id.py              11 passed
 ```
 
 Each suite creates a dedicated `poll_test` schema, runs, and drops it, so nothing else in the
