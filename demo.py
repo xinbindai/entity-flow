@@ -12,7 +12,7 @@ its subscription, and a scripted walkthrough.
 Run it against Postgres; models.py uses JSONB, gen_random_uuid() and a
 PL/pgSQL trigger that only exist there:
 
-    pip install "sqlalchemy>=2.0" psycopg2-binary
+    pip install "sqlalchemy>=2.0" psycopg2
 
     # scripted walkthrough: rebuild the schema, produce one event, consume it
     python demo.py postgresql+psycopg2://localhost/lab_platform_demo

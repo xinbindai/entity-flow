@@ -33,6 +33,19 @@ The full design, including the alternative schema that was evaluated and rejecte
 Needs PostgreSQL — the model uses `JSONB`, `gen_random_uuid()` and a PL/pgSQL trigger, so
 SQLite won't do.
 
+The `psycopg2` dependency is the source distribution, not `psycopg2-binary`, so the client
+library and a compiler have to be present before installing — the binary wheel bundles its
+own libpq and OpenSSL, which is not a choice a library should make for its consumers:
+
+```bash
+sudo apt install libpq-dev python3-dev build-essential   # Debian/Ubuntu
+brew install postgresql                                  # macOS
+```
+
+Without them the install fails with `Error: pg_config executable not found`. If you would
+rather not build from source, install `psycopg2-binary` yourself — it provides the same
+`psycopg2` module, so nothing else changes.
+
 ```bash
 uv sync
 cp .env.example .env      # then set POSTGRES_URL

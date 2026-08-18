@@ -1,6 +1,6 @@
 [project]
 name = "entity-flow"
-version = "0.3.1"
+version = "0.4.0"
 description = "Entity-event-task model for a sequencing lab platform: a unified polymorphic entity schema plus transactional-outbox event machinery"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -24,7 +24,12 @@ dependencies = [
     # runs on Python 3.12. Earlier ones call entry_points().get(), which
     # importlib.metadata dropped in 3.12, and crash on import.
     "celery>=5.3.5",
-    "psycopg2-binary>=2.9.12",
+    # psycopg2, not psycopg2-binary: the binary wheel bundles its own copies
+    # of libpq and OpenSSL, and a library that pins those on every consumer
+    # is deciding something that belongs to the deployment. The cost is that
+    # installing now builds from source, so it needs pg_config (libpq-dev or
+    # equivalent) and a C compiler present.
+    "psycopg2>=2.9.12",
     "sqlalchemy>=2.0",
 ]
 
