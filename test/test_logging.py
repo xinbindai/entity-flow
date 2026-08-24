@@ -12,7 +12,9 @@ conclude the wrong thing.
 from __future__ import annotations
 
 import logging
+import re
 import sys
+import time
 import traceback
 import uuid
 from pathlib import Path
@@ -267,6 +269,80 @@ def test_a_skipped_event_says_why(session: Session) -> None:
 
 
 # --------------------------------------------------------------------------
+# Bracketing the handler call. The point of the pair is to separate time and
+# failures inside the handler from this module's own work around it, and to
+# name only things that exist as columns, so a log line leads back to a row.
+# --------------------------------------------------------------------------
+def test_the_handler_call_is_bracketed(session: Session) -> None:
+    task = make_task(session)
+    make_event(session, task, seq=0)
+
+    with Captured() as log:
+        poll_and_dispatch(session, handler_name="h", event_types=TYPES, handle=noop)
+
+    text = log.text()
+    assert "entering handler" in text, text
+    assert "left handler" in text, text
+
+
+def test_both_ends_name_the_handler_and_the_event_type(session: Session) -> None:
+    """The two fields a log search actually starts from."""
+    task = make_task(session)
+    ev = make_event(session, task, seq=0)
+
+    with Captured() as log:
+        poll_and_dispatch(session, handler_name="create-result", event_types=TYPES, handle=noop)
+
+    for phrase in ("entering handler", "left handler"):
+        line = [m for m in log.messages() if phrase in m]
+        assert len(line) == 1, f"{phrase}: {log.text()}"
+        assert "create-result" in line[0], line[0]
+        assert TYPES[0] in line[0], f"the event type must appear on the {phrase} line: {line[0]}"
+        assert str(ev.event_id) in line[0], line[0]
+
+
+def test_the_bracket_is_balanced_when_the_handler_raises(session: Session) -> None:
+    task = make_task(session)
+    make_event(session, task, seq=0)
+
+    with Captured() as log:
+        poll_and_dispatch(session, handler_name="h", event_types=TYPES, handle=boom)
+
+    text = log.text()
+    assert "entering handler" in text and "left handler" in text, \
+        "an entering with no left should mean the process died, not that it raised"
+
+
+def test_the_exit_line_reports_how_long_the_handler_took(session: Session) -> None:
+    """Timed around the call alone, so the commit that follows is not counted."""
+    task = make_task(session)
+    make_event(session, task, seq=0)
+
+    def slow(session: Session, ev) -> None:
+        time.sleep(0.05)
+
+    with Captured() as log:
+        poll_and_dispatch(session, handler_name="h", event_types=TYPES, handle=slow)
+
+    line = [m for m in log.messages() if "left handler" in m][0]
+    ms = float(re.search(r"after ([0-9.]+) ms", line).group(1))
+    assert 50 <= ms < 5000, f"expected roughly 50ms, got {ms}: {line}"
+
+
+def test_a_failing_event_is_still_identified_by_type(session: Session) -> None:
+    """So one event type can be filtered out of a noisy log without losing it."""
+    task = make_task(session)
+    make_event(session, task, seq=0)
+
+    with Captured() as log:
+        poll_and_dispatch(session, handler_name="h", event_types=TYPES, handle=boom)
+
+    raised = [m for m in log.messages() if "raised" in m]
+    assert raised and TYPES[0] in raised[0], raised
+
+
+
+# --------------------------------------------------------------------------
 TESTS = [
     test_a_successful_dispatch_is_traceable_by_event_id,
     test_an_empty_poll_says_no_such_events,
@@ -281,6 +357,11 @@ TESTS = [
     test_replay_logs_the_ids_it_will_run,
     test_dispatch_once_reports_the_pass_total,
     test_a_skipped_event_says_why,
+    test_the_handler_call_is_bracketed,
+    test_both_ends_name_the_handler_and_the_event_type,
+    test_the_bracket_is_balanced_when_the_handler_raises,
+    test_the_exit_line_reports_how_long_the_handler_took,
+    test_a_failing_event_is_still_identified_by_type,
 ]
 
 

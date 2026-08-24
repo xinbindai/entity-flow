@@ -87,9 +87,12 @@ class HandlerCancelled(Exception):
 # also turning on every SQL statement SQLAlchemy emits. basicConfig(DEBUG)
 # alone works too, and is much noisier.
 #
-# Messages carry handler_name and event_id so a single event can be followed
-# end to end with grep. All arguments are passed lazily, so a disabled DEBUG
-# level costs one comparison rather than a format.
+# Messages carry handler_name, event_id and event_type -- all three columns, so
+# a line found in the log leads back to a row and a row leads back to its
+# lines. The handler call is bracketed by an entering/left pair, which is what
+# separates time spent in the handler from time spent committing it. All
+# arguments are passed lazily, so a disabled DEBUG level costs one comparison
+# rather than a format.
 log = logging.getLogger(__name__)
 
 # How many consecutive failures before poll_and_dispatch stops selecting an
@@ -519,15 +522,38 @@ def _dispatch(
         else:
             session.execute(select(func.pg_advisory_xact_lock(key)))
 
+        # event_type is read before the call: a handler that raises rolls the
+        # session back, which expires `ev`, and the exit line would otherwise
+        # pay for a reload just to name the type it already knew.
+        event_type = ev.event_type
+
         try:
             log.debug(
-                "%s: dispatching event %s (%s)", handler_name, event_id, ev.event_type
+                "%s: dispatching event %s (%s) -- entering handler",
+                handler_name, event_id, event_type,
             )
-            handle(session, ev)
+            started = time.monotonic()
+            try:
+                handle(session, ev)
+            finally:
+                # Both ends name handler_name, event_id and event_type -- all
+                # three are columns, so a line found in the log leads back to a
+                # row and a row leads back to its lines. In a finally so the
+                # pair is always balanced: an "entering" with no "left" means
+                # the process died inside the handler, which is a different
+                # thing from it raising, and the next line says which.
+                log.debug(
+                    "%s: left handler for event %s (%s) after %.1f ms",
+                    handler_name, event_id, event_type,
+                    (time.monotonic() - started) * 1000,
+                )
             _settle(session, handler_name, event_id, overwrite=overwrite_checkpoint)
             session.commit()
             succeeded += 1
-            log.debug("%s: event %s handled and checkpointed", handler_name, event_id)
+            log.debug(
+                "%s: event %s (%s) handled and checkpointed",
+                handler_name, event_id, event_type,
+            )
         except HandlerCancelled as exc:
             # Not a failure: the handler decided this event is not its
             # business. Roll its partial work back, then settle the event so
@@ -540,8 +566,8 @@ def _dispatch(
             session.commit()
             settled += 1
             log.info(
-                "%s: event %s cancelled by the handler -- %s. It will not be retried",
-                handler_name, event_id, exc or "no reason given",
+                "%s: event %s (%s) cancelled by the handler -- %s. It will not be retried",
+                handler_name, event_id, event_type, exc or "no reason given",
             )
         except Exception as exc:
             # Discard the handler's partial writes. This also leaves any
@@ -549,8 +575,8 @@ def _dispatch(
             # a processed event look unprocessed.
             session.rollback()
             log.debug(
-                "%s: event %s raised %s: %s",
-                handler_name, event_id, type(exc).__name__, exc,
+                "%s: event %s (%s) raised %s: %s",
+                handler_name, event_id, event_type, type(exc).__name__, exc,
             )
             if not record_failures:
                 raise
