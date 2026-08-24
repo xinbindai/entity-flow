@@ -21,11 +21,12 @@ The full design, including the alternative schema that was evaluated and rejecte
 | `entitymodel/taxonomy_sync.py` | Load a taxonomy from CSV and reconcile the database with it |
 | `entitymodel/celery_tasks.py` | Submit Celery tasks that are also `Task` entities, and drive the row through its lifecycle |
 | `entitymodel/celery_workers.py` | Start, stop and supervise a Celery worker fleet from a config dict |
+| `entitymodel/log_search.py` | Filter a log file down to one handler's run, including the lines the handler itself wrote |
 | `entitymodel/*.sql` | The schema as reference DDL, with the design rationale in comments. Tables only — the taxonomy rows live in the CSVs |
 | `taxonomy.py` | **This** lab's categories — the taxonomy CSVs plus the `Patient`/`Sample`/… subclasses. Another deployment replaces this file. |
 | `entity_types.csv`, `entity_statuses.csv` | The taxonomy itself — editable without touching Python |
 | `demo.py` | A worked example: one handler, a scripted walkthrough, and a runnable worker |
-| `test/` | Fourteen suites, 185 tests, run against a real PostgreSQL |
+| `test/` | Fifteen suites, 206 tests, run against a real PostgreSQL |
 | `migrations/` | Alembic revisions; `alembic.ini` at the root |
 
 ## Setup
@@ -140,6 +141,7 @@ test/test_dispatch_retry.py        16 passed
 test/test_entity_subclasses.py     7 passed
 test/test_event_timing.py          14 passed
 test/test_importing.py             9 passed
+test/test_log_search.py            21 passed
 test/test_logging.py               18 passed
 test/test_poll_and_dispatch.py     8 passed
 test/test_registry.py              21 passed
@@ -259,18 +261,33 @@ and doing only the second is the usual mistake — a record has to pass the logg
 ```python
 import logging
 
-logging.basicConfig(level=logging.INFO)                            # 1. somewhere to go
+logging.basicConfig(                                               # 1. somewhere to go
+    level=logging.INFO,
+    format="%(asctime)s [%(process)d] %(levelname)-5s %(name)s: %(message)s",
+)
 logging.getLogger("entitymodel.outbox").setLevel(logging.DEBUG)    # 2. the level
 ```
+
+`%(process)d` is worth having from the start. Several workers write to one log, and it is
+what lets `log_search` below tell one worker's lines from another's — without it the two
+interleave and attribution becomes a guess. Use `[%(process)d:%(thread)d]` if a process
+dispatches in several threads.
 
 That way round keeps the detail to this module. `basicConfig(level=logging.DEBUG)` works
 too, but also turns on every SQL statement SQLAlchemy emits.
 
 ```
 my-handler: polled ['AnalysisTaskSucceeded'] -> 1 candidate(s) (batch_size=100, max_attempts=5)
-my-handler: dispatching event 3a947502-… (AnalysisTaskSucceeded)
-my-handler: event 3a947502-… handled and checkpointed
+my-handler: dispatching event 3a947502-… (AnalysisTaskSucceeded) -- entering handler
+my-handler: left handler for event 3a947502-… (AnalysisTaskSucceeded) after 20.1 ms
+my-handler: event 3a947502-… (AnalysisTaskSucceeded) handled and checkpointed
 ```
+
+Every line names the handler, the event id and the event type — all three are columns, so a
+line leads back to a row and a row leads back to its lines. The `entering`/`left` pair
+brackets the handler call itself, which is what separates time spent in your code from time
+spent committing it, and what makes a handler that never returned distinguishable from one
+that raised.
 
 The message worth knowing about is the one for a poll that found nothing, since "my handler
 isn't running" is the usual complaint and the reason is otherwise invisible — the query
@@ -292,6 +309,47 @@ signal, is the failure that costs most to find late:
 WARNING  my-handler: event af7c41e7-… dead-lettered after 5 attempt(s); last error
          RuntimeError: disk on fire. It will not be retried -- see dead_lettered() and replay()
 ```
+
+### Pulling one run out of a log file
+
+The lines your handler writes go to your own logger and carry no handler name or event id —
+nothing in the text ties them to the run that produced them. What ties them is position:
+they sit between the `entering` and `left` brackets. `search_logs` reads those brackets and
+returns the whole run, your lines included:
+
+```console
+$ python -m entitymodel.log_search app.log --handler archive --event 52c97fc4-…
+  2026-08-23 20:08:51,673 DEBUG entitymodel.outbox: archive: dispatching event 52c97fc4-… -- entering handler
+  2026-08-23 20:08:51,673 INFO  myapp.handlers: starting archive
+  2026-08-23 20:08:51,673 DEBUG entitymodel.outbox: archive: left handler for event 52c97fc4-… after 0.4 ms
+  2026-08-23 20:08:51,674 DEBUG entitymodel.outbox: archive: event 52c97fc4-… raised RuntimeError: cold storage unreachable
+```
+
+```python
+from entitymodel.log_search import search_logs
+
+for line in search_logs("app.log", "worker-2.log", handler_name="archive"):
+    print(line.text)
+```
+
+Either filter is optional, several files merge in time order, and a traceback stays attached
+to the record that raised it. `include_handler_lines=False` gives the shape of a run without
+its contents, for when the handler is chatty and the question is only how long it took.
+
+Position is only proof of authorship while one run is open at a time — which is why the
+format above carries `%(process)d`. With it, brackets are matched per process and two workers
+interleaving in one file are separated exactly:
+
+```
+  [2073188:1359…6240] DEBUG entitymodel.outbox: create-result: dispatching event 200c3e1b-… -- entering handler
+  [2073188:1359…3536] DEBUG entitymodel.outbox: archive: dispatching event 200c3e1b-… -- entering handler
+  [2073188:1359…6240] INFO  myapp.handlers: RESULT step 0      ← claimed by create-result only
+  [2073188:1359…3536] INFO  myapp.handlers: ARCHIVE step 0     ← claimed by archive only
+```
+
+Without it every line looks alike, attribution falls back to "whatever was open", and a line
+picked up while two runs were open comes back with `ambiguous=True`, marked `?` on the command
+line. The doubt is reported rather than hidden.
 
 ## Managing workers
 

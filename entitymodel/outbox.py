@@ -80,8 +80,15 @@ class HandlerCancelled(Exception):
 # setLevel alone gives it nowhere to go:
 #
 #     import logging
-#     logging.basicConfig(level=logging.INFO)                     # 1. a handler
+#     logging.basicConfig(                                        # 1. a handler
+#         level=logging.INFO,
+#         format="%(asctime)s [%(process)d] %(levelname)-5s %(name)s: %(message)s",
+#     )
 #     logging.getLogger("entitymodel.outbox").setLevel(logging.DEBUG)   # 2. the level
+#
+# %(process)d is not decoration. Several workers share a log, and it is what lets
+# entitymodel.log_search tell one worker's lines from another's when their runs
+# interleave; without it that attribution degrades to a guess.
 #
 # Done that way round the debug detail is limited to this module, rather than
 # also turning on every SQL statement SQLAlchemy emits. basicConfig(DEBUG)
