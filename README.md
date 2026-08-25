@@ -26,7 +26,7 @@ The full design, including the alternative schema that was evaluated and rejecte
 | `taxonomy.py` | **This** lab's categories — the taxonomy CSVs plus the `Patient`/`Sample`/… subclasses. Another deployment replaces this file. |
 | `entity_types.csv`, `entity_statuses.csv` | The taxonomy itself — editable without touching Python |
 | `demo.py` | A worked example: one handler, a scripted walkthrough, and a runnable worker |
-| `test/` | Fifteen suites, 206 tests, run against a real PostgreSQL |
+| `test/` | Fifteen suites, 209 tests, run against a real PostgreSQL |
 | `migrations/` | Alembic revisions; `alembic.ini` at the root |
 
 ## Setup
@@ -142,7 +142,7 @@ test/test_entity_subclasses.py     7 passed
 test/test_event_timing.py          14 passed
 test/test_importing.py             9 passed
 test/test_log_search.py            21 passed
-test/test_logging.py               18 passed
+test/test_logging.py               21 passed
 test/test_poll_and_dispatch.py     8 passed
 test/test_registry.py              21 passed
 test/test_replay.py                9 passed
@@ -254,7 +254,20 @@ that was never sent has no `celery_task_id`.
 
 ## Troubleshooting a handler
 
-`entitymodel.outbox` logs its dispatch decisions at DEBUG. Turning them on takes two steps,
+`entitymodel.outbox` logs its dispatch decisions across three levels:
+
+| Level | What |
+|---|---|
+| `INFO` | the `entering`/`left` pair bracketing each handler call, and a handler cancelling an event |
+| `WARNING` | dead-lettering |
+| `DEBUG` | everything else — polling, claims, checkpoints, why a poll dispatched nothing |
+
+The bracket is INFO on purpose: `log_search` below reads it to attribute the lines your handler
+wrote, and those are INFO. At DEBUG the brackets disappear from an ordinary production log while
+your handler's own output stays, and the run stops being attributable exactly when you need it.
+Nothing else was promoted, so INFO stays two lines per dispatched event.
+
+Turning the DEBUG detail on takes two steps,
 and doing only the second is the usual mistake — a record has to pass the logger's level
 **and** reach a handler:
 
@@ -319,9 +332,9 @@ returns the whole run, your lines included:
 
 ```console
 $ python -m entitymodel.log_search app.log --handler archive --event 52c97fc4-…
-  2026-08-23 20:08:51,673 DEBUG entitymodel.outbox: archive: dispatching event 52c97fc4-… -- entering handler
+  2026-08-23 20:08:51,673 INFO  entitymodel.outbox: archive: dispatching event 52c97fc4-… -- entering handler
   2026-08-23 20:08:51,673 INFO  myapp.handlers: starting archive
-  2026-08-23 20:08:51,673 DEBUG entitymodel.outbox: archive: left handler for event 52c97fc4-… after 0.4 ms
+  2026-08-23 20:08:51,673 INFO  entitymodel.outbox: archive: left handler for event 52c97fc4-… after 0.4 ms
   2026-08-23 20:08:51,674 DEBUG entitymodel.outbox: archive: event 52c97fc4-… raised RuntimeError: cold storage unreachable
 ```
 
@@ -341,8 +354,8 @@ format above carries `%(process)d`. With it, brackets are matched per process an
 interleaving in one file are separated exactly:
 
 ```
-  [2073188:1359…6240] DEBUG entitymodel.outbox: create-result: dispatching event 200c3e1b-… -- entering handler
-  [2073188:1359…3536] DEBUG entitymodel.outbox: archive: dispatching event 200c3e1b-… -- entering handler
+  [2073188:1359…6240] INFO  entitymodel.outbox: create-result: dispatching event 200c3e1b-… -- entering handler
+  [2073188:1359…3536] INFO  entitymodel.outbox: archive: dispatching event 200c3e1b-… -- entering handler
   [2073188:1359…6240] INFO  myapp.handlers: RESULT step 0      ← claimed by create-result only
   [2073188:1359…3536] INFO  myapp.handlers: ARCHIVE step 0     ← claimed by archive only
 ```

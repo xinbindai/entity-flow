@@ -96,10 +96,20 @@ class HandlerCancelled(Exception):
 #
 # Messages carry handler_name, event_id and event_type -- all three columns, so
 # a line found in the log leads back to a row and a row leads back to its
-# lines. The handler call is bracketed by an entering/left pair, which is what
-# separates time spent in the handler from time spent committing it. All
-# arguments are passed lazily, so a disabled DEBUG level costs one comparison
-# rather than a format.
+# lines. All arguments are passed lazily, so a disabled level costs one
+# comparison rather than a format.
+#
+# Three levels, deliberately:
+#
+#   INFO     the entering/left pair bracketing the handler call, and a handler
+#            cancelling an event. The pair is INFO because log_search needs it
+#            to attribute the handler's own output, which is itself INFO -- at
+#            DEBUG the brackets disappear from a production log and take that
+#            ability with them.
+#   WARNING  dead-lettering. An event nobody will retry, dropped with no
+#            signal, is the failure that costs most to find late.
+#   DEBUG    everything else -- polling, claims, checkpoints, why a poll
+#            dispatched nothing.
 log = logging.getLogger(__name__)
 
 # How many consecutive failures before poll_and_dispatch stops selecting an
@@ -535,7 +545,14 @@ def _dispatch(
         event_type = ev.event_type
 
         try:
-            log.debug(
+            # INFO, not DEBUG, and the pair below with it. These two lines
+            # delimit the handler's run, and entitymodel.log_search reads them
+            # to attribute the lines the handler itself wrote -- which are
+            # INFO. At DEBUG the brackets vanish from an ordinary production
+            # log while the handler's own output stays, and the run becomes
+            # unattributable exactly when someone needs it. Everything else
+            # here stays DEBUG: this is the one pair worth the volume.
+            log.info(
                 "%s: dispatching event %s (%s) -- entering handler",
                 handler_name, event_id, event_type,
             )
@@ -549,7 +566,7 @@ def _dispatch(
                 # pair is always balanced: an "entering" with no "left" means
                 # the process died inside the handler, which is a different
                 # thing from it raising, and the next line says which.
-                log.debug(
+                log.info(
                     "%s: left handler for event %s (%s) after %.1f ms",
                     handler_name, event_id, event_type,
                     (time.monotonic() - started) * 1000,

@@ -343,6 +343,52 @@ def test_a_failing_event_is_still_identified_by_type(session: Session) -> None:
 
 
 # --------------------------------------------------------------------------
+# The bracket's level. It is INFO rather than DEBUG because log_search needs
+# it to attribute the handler's own output, which is itself INFO -- at DEBUG
+# the brackets vanish from an ordinary production log and take that ability
+# with them. Pinned, because a level is a one-word change away from silently
+# undoing that.
+# --------------------------------------------------------------------------
+def test_the_bracket_is_logged_at_info(session: Session) -> None:
+    task = make_task(session)
+    make_event(session, task, seq=0)
+
+    with Captured() as log:
+        poll_and_dispatch(session, handler_name="h", event_types=TYPES, handle=noop)
+
+    info = log.text(logging.INFO)
+    assert "entering handler" in info, f"expected at INFO, got: {log.text()}"
+    assert "left handler" in info, f"expected at INFO, got: {log.text()}"
+
+
+def test_the_bracket_survives_when_debug_is_off(session: Session) -> None:
+    """The guarantee log_search rests on: a production log still delimits runs."""
+    task = make_task(session)
+    make_event(session, task, seq=0)
+
+    with Captured(level=logging.INFO) as log:
+        poll_and_dispatch(session, handler_name="h", event_types=TYPES, handle=noop)
+
+    text = log.text()
+    assert "entering handler" in text and "left handler" in text, text
+
+
+def test_the_rest_stays_at_debug(session: Session) -> None:
+    """Only the pair is promoted. INFO must not turn into a firehose."""
+    task = make_task(session)
+    make_event(session, task, seq=0)
+
+    with Captured(level=logging.INFO) as log:
+        poll_and_dispatch(session, handler_name="h", event_types=TYPES, handle=noop)
+
+    text = log.text()
+    assert "candidate(s)" not in text, f"polling detail leaked to INFO: {text}"
+    assert "handled and checkpointed" not in text, f"checkpoint detail leaked to INFO: {text}"
+    assert len(log.messages()) == 2, f"exactly the pair, got: {log.messages()}"
+
+
+
+# --------------------------------------------------------------------------
 TESTS = [
     test_a_successful_dispatch_is_traceable_by_event_id,
     test_an_empty_poll_says_no_such_events,
@@ -362,6 +408,9 @@ TESTS = [
     test_the_bracket_is_balanced_when_the_handler_raises,
     test_the_exit_line_reports_how_long_the_handler_took,
     test_a_failing_event_is_still_identified_by_type,
+    test_the_bracket_is_logged_at_info,
+    test_the_bracket_survives_when_debug_is_off,
+    test_the_rest_stays_at_debug,
 ]
 
 

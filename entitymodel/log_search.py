@@ -8,7 +8,9 @@ included.
         print(line.text)
 
 Every line entitymodel.outbox writes names handler_name, event_id and
-event_type, so filtering those is a matter of matching them. The lines the
+event_type, so filtering those is a matter of matching them. The brackets this
+relies on are logged at INFO, so an ordinary production log has what it needs
+and nothing has to be running at DEBUG. The lines the
 handler itself writes are the problem this module exists for: they go to the
 application's own logger, and carry none of the three. Nothing in the text
 ties them to the run that produced them.
