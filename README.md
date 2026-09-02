@@ -22,12 +22,13 @@ The full design, including the alternative schema that was evaluated and rejecte
 | `entitymodel/celery_tasks.py` | Submit Celery tasks that are also `Task` entities, and drive the row through its lifecycle |
 | `entitymodel/celery_workers.py` | Start, stop and supervise a Celery worker fleet from a config dict |
 | `entitymodel/log_search.py` | Filter a log file down to one handler's run, including the lines the handler itself wrote |
+| `entitymodel/migrate.py` | Apply the packaged Alembic revisions from an installed copy — `python -m entitymodel.migrate upgrade head` |
+| `entitymodel/migrations/` | The revisions themselves, inside the package so they reach the wheel |
 | `entitymodel/*.sql` | The schema as reference DDL, with the design rationale in comments. Tables only — the taxonomy rows live in the CSVs |
 | `taxonomy.py` | **This** lab's categories — the taxonomy CSVs plus the `Patient`/`Sample`/… subclasses. Another deployment replaces this file. |
 | `entity_types.csv`, `entity_statuses.csv` | The taxonomy itself — editable without touching Python |
 | `demo.py` | A worked example: one handler, a scripted walkthrough, and a runnable worker |
-| `test/` | Sixteen suites, 230 tests, run against a real PostgreSQL |
-| `migrations/` | Alembic revisions; `alembic.ini` at the root |
+| `test/` | Seventeen suites, 243 tests, run against a real PostgreSQL |
 
 ## Setup
 
@@ -189,6 +190,7 @@ test/test_event_timing.py          14 passed
 test/test_importing.py             9 passed
 test/test_log_search.py            25 passed
 test/test_logging.py               21 passed
+test/test_migrate.py               13 passed
 test/test_poll_and_dispatch.py     8 passed
 test/test_registry.py              21 passed
 test/test_replay.py                9 passed
@@ -445,15 +447,53 @@ process is gone reads as "not running" and is cleaned up.
 Schema changes go through Alembic. `create_all()` builds a correct schema from scratch but
 never issues `ALTER`, so it cannot upgrade a database that already exists.
 
+### From an installed package
+
+The revisions ship **inside** the wheel, at `entitymodel/migrations/`, so a deployment that
+only ran `pip install` can build and evolve its schema without a checkout:
+
+```bash
+pip install 'entity-flow[migrations]'
+
+python -m entitymodel.migrate upgrade head --db-url postgresql+psycopg2://host/db
+python -m entitymodel.migrate current      --db-url ...
+python -m entitymodel.migrate downgrade -1 --db-url ...
+python -m entitymodel.migrate history
+```
+
+`entity-flow-migrate` is installed as a console script and takes the same arguments, which is
+usually what a deploy job invokes. `--sql` prints the statements instead of running them, for
+a deployment that applies schema changes through review rather than from the application.
+
+Alembic is an **extra**, not a hard dependency: a process that only reads from the database
+has no use for a migration tool, and most deployments migrate from a deploy job rather than
+from the application. `entitymodel.migrate` names the extra if it is missing rather than
+failing with a bare `ModuleNotFoundError`.
+
+To drive it from your own code — a deploy script, a test fixture, a startup check:
+
+```python
+from alembic import command
+from entitymodel.migrate import make_config
+
+command.upgrade(make_config(db_url), "head")
+```
+
+> `--db-url` is passed to Alembic as an attribute rather than as `sqlalchemy.url`, so a
+> password containing `%` survives — main options go through ConfigParser interpolation.
+
+### From a checkout
+
+The Alembic CLI works as before, reading `POSTGRES_URL` from the environment or `.env`:
+
 ```bash
 alembic upgrade head                       # apply everything
 alembic check                              # fail if the models have drifted
 alembic revision --autogenerate -m "..."   # draft the next revision
 ```
 
-The URL comes from `POSTGRES_URL` — environment or `.env` — so `alembic.ini` holds no
-credentials. If you have a database that already matches the models, `alembic stamp head`
-adopts it without re-running anything.
+`alembic.ini` holds no credentials. If you have a database that already matches the models,
+`alembic stamp head` adopts it without re-running anything.
 
 One thing autogenerate will not do for you: it compares tables, columns, indexes and
 constraints, and is **blind to functions and triggers**. The entity status-validation

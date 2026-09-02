@@ -117,12 +117,17 @@ wheels = [
 
 [[package]]
 name = "entity-flow"
-version = "0.6.0"
+version = "0.7.0"
 source = { editable = "." }
 dependencies = [
     { name = "celery" },
     { name = "psycopg2" },
     { name = "sqlalchemy" },
+]
+
+[package.optional-dependencies]
+migrations = [
+    { name = "alembic" },
 ]
 
 [package.dev-dependencies]
@@ -132,10 +137,12 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "alembic", marker = "extra == 'migrations'", specifier = ">=1.13" },
     { name = "celery", specifier = ">=5.3.5" },
     { name = "psycopg2", specifier = ">=2.9.12" },
     { name = "sqlalchemy", specifier = ">=2.0" },
 ]
+provides-extras = ["migrations"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "alembic", specifier = ">=1.18.5" }]

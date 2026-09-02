@@ -1,13 +1,23 @@
 """
 Alembic environment.
 
-The database URL is deliberately not in alembic.ini -- it comes from
-POSTGRES_URL in the environment, or from .env at the repo root, so credentials
-stay out of version control and match what the test suite and demo already use.
+These migrations ship inside the installed package, so a deployment that only
+has the wheel can still build and evolve its schema -- see entitymodel.migrate,
+which is the supported entry point:
+
+    python -m entitymodel.migrate upgrade head --db-url postgresql+psycopg2://...
+
+From a checkout, the alembic CLI works as before and reads .env:
 
     alembic upgrade head                       # apply everything
     alembic revision --autogenerate -m "..."   # draft the next one
     alembic downgrade -1                       # step back
+
+The database URL is deliberately not in alembic.ini. It is taken, in order,
+from the caller (migrate.py passes it through config.attributes), then
+POSTGRES_URL in the environment, then a .env in the working directory -- so
+credentials stay out of version control, and an installed copy never depends
+on a repository layout that is not there.
 
 Autogenerate sees tables, columns, indexes and constraints. It does NOT see
 the PL/pgSQL status-validation trigger, so any revision that changes it has to
@@ -24,8 +34,10 @@ from pathlib import Path
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO_ROOT))
+# Only needed when running from a checkout, where entitymodel may not be on
+# the path yet. Installed, it already is, and this resolves to site-packages
+# where the insert is harmless.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from entitymodel.models import Base  # noqa: E402
 
@@ -38,12 +50,23 @@ target_metadata = Base.metadata
 
 
 def _database_url() -> str:
-    """POSTGRES_URL from the environment, falling back to .env at the root."""
+    """
+    The caller's url, then POSTGRES_URL, then a .env in the working directory.
+
+    The caller comes first so entitymodel.migrate can pass --db-url straight
+    through: an installed copy has no repository around it, and a deployment
+    should not have to set an environment variable to name the database it is
+    already holding a connection string for.
+    """
+    url = config.attributes.get("db_url")
+    if url:
+        return url
+
     url = os.environ.get("POSTGRES_URL")
     if url:
         return url
 
-    env_file = REPO_ROOT / ".env"
+    env_file = Path.cwd() / ".env"
     if env_file.exists():
         for line in env_file.read_text().splitlines():
             line = line.strip()
@@ -54,8 +77,8 @@ def _database_url() -> str:
                 return value.strip().strip('"').strip("'")
 
     raise SystemExit(
-        "POSTGRES_URL is not set. Export it, or copy "
-        f"{REPO_ROOT / '.env.example'} to .env and fill it in."
+        "No database URL. Pass --db-url, export POSTGRES_URL, or put it in a "
+        ".env in the working directory."
     )
 
 
