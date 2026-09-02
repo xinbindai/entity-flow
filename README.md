@@ -26,7 +26,7 @@ The full design, including the alternative schema that was evaluated and rejecte
 | `taxonomy.py` | **This** lab's categories — the taxonomy CSVs plus the `Patient`/`Sample`/… subclasses. Another deployment replaces this file. |
 | `entity_types.csv`, `entity_statuses.csv` | The taxonomy itself — editable without touching Python |
 | `demo.py` | A worked example: one handler, a scripted walkthrough, and a runnable worker |
-| `test/` | Fifteen suites, 209 tests, run against a real PostgreSQL |
+| `test/` | Sixteen suites, 230 tests, run against a real PostgreSQL |
 | `migrations/` | Alembic revisions; `alembic.ini` at the root |
 
 ## Setup
@@ -109,6 +109,51 @@ ever seen. Treat it like a table name, not a variable name.
 Adding a second handler for the same event type is one more `@registry.on` and nothing else:
 no change to the producer, none to the existing handler. Each keeps its own checkpoints.
 
+## Channels
+
+`event_type` says *what happened*. `channel` says *where it was published* — a routing scope
+stamped on the event when it is fired, and never changed afterwards. The two are orthogonal:
+one type can go to several channels, one channel carries many types.
+
+```python
+fire_event(session, sample, event_type="SampleReceived", new_status="Received",
+           payload={...}, source="lims", actor_type="user", channel="lab-a")
+```
+
+A subscription that names no channel consumes `default`, which is also where an event goes
+when its producer names none — so the field is inert until you start using it.
+
+```python
+# only lab-a's events
+@registry.on("SampleReceived", name="lab-a-accession", channels=["lab-a"])
+def accession(session, ev): ...
+
+# every channel, including ones that do not exist yet
+@registry.on("SampleReceived", name="audit-trail", channels=ALL_CHANNELS)
+def audit(session, ev): ...
+```
+
+Both subscribe to the same event type and neither disturbs the other: idempotency is keyed
+`(handler_name, event_id)`, so one event gets one checkpoint per handler and channel never
+enters the ledger.
+
+**Naming no channel means `default`, not every channel.** That matters the day someone
+introduces a channel: a wildcard default would silently start feeding existing handlers the
+new channel's events, which under tenancy is a leak and gives no signal at all. Failing
+closed produces the opposite failure — a handler stops receiving — which is loud, and which
+the empty-poll explanation names outright. `ALL_CHANNELS` is how you say the other thing, and
+it has to be written.
+
+`ALL_CHANNELS` is a sentinel object rather than the string `"*"`, so the wildcard never shares
+a value space with real channel names. `"*"` is accepted as an alias, for configuration files
+that cannot hold a Python object, and is therefore reserved as a channel name. Two
+consequences worth deciding on deliberately: a handler on `ALL_CHANNELS` picks up channels
+invented later, and — like any new `handler_name` — its first run replays history, in its case
+across every channel at once.
+
+Channel is not enforced against a lookup table yet, so a typo makes a channel nothing consumes.
+Until it is, the diagnostic below is what catches it.
+
 ## Running a worker
 
 ```bash
@@ -136,12 +181,13 @@ for f in test/test_*.py; do python "$f"; done
 test/test_cancelled.py             18 passed
 test/test_celery_tasks.py          17 passed
 test/test_celery_workers.py        15 passed
+test/test_channels.py              17 passed
 test/test_concurrency.py           5 passed
 test/test_dispatch_retry.py        16 passed
 test/test_entity_subclasses.py     7 passed
 test/test_event_timing.py          14 passed
 test/test_importing.py             9 passed
-test/test_log_search.py            21 passed
+test/test_log_search.py            25 passed
 test/test_logging.py               21 passed
 test/test_poll_and_dispatch.py     8 passed
 test/test_registry.py              21 passed
@@ -308,12 +354,20 @@ excludes rows silently:
 
 ```
 my-handler: nothing to do because no events of type ['Nope'] exist yet
+my-handler: nothing to do because 2 event(s) of type ['SampleReceived'] exist, but none in
+            channel(s) ['lab_a'] -- they are in ['lab-a']
 my-handler: nothing to do because of 2 event(s): 2 already processed, 0 dead-lettered, 0 backing off
 my-handler: nothing to do because of 2 event(s): 0 already processed, 0 dead-lettered, 2 backing off
 my-handler: nothing to do because of 2 event(s): 0 already processed, 2 dead-lettered, 0 backing off
 ```
 
-That explanation costs an extra query, so it only runs when DEBUG is actually enabled.
+The second line is why the diagnostic had to learn about channels in the same change that
+introduced them. A handler subscribed to `lab-a` while its producer stamps `lab_a` would
+otherwise be told *no events of that type exist yet* — false, and it sends the reader to the
+producer instead of to the typo. A channel nothing consumes is otherwise indistinguishable
+from a system with nothing to do.
+
+That explanation costs extra queries, so it only runs when DEBUG is actually enabled.
 
 Dead-lettering logs at **WARNING**, not DEBUG — an event nobody will retry, dropped with no
 signal, is the failure that costs most to find late:

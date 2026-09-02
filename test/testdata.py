@@ -118,6 +118,7 @@ def make_event(
     sample_id: str | None = None,
     occurred_at: datetime | None = None,
     trace_id: str | None = None,
+    channel: str = "default",
     commit: bool = True,
 ) -> EventRecord:
     """
@@ -132,6 +133,7 @@ def make_event(
         event_type=event_type,
         entity_type=task.category,
         entity_id=task.id,
+        channel=channel,
         correlation_id=task.correlation_id,
         source="pipeline-worker",
         actor_type="worker",

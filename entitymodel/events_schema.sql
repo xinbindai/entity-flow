@@ -20,6 +20,13 @@ CREATE TABLE events (
     event_type          TEXT NOT NULL,              -- 'SequencingReady', 'AnalysisTaskSucceeded', ...
     schema_version       INT NOT NULL DEFAULT 1,      -- for safe payload evolution
 
+    -- routing scope: where this event was published (section 3.7). Orthogonal
+    -- to event_type -- one type can go to several channels, one channel
+    -- carries many types. NOT NULL because a nullable routing key puts
+    -- three-valued logic into the consumer's selection, and `channel = NULL`
+    -- is never true, so the failure would be silent under-delivery.
+    channel              TEXT NOT NULL DEFAULT 'default',
+
     -- subject: what entity is this event about
     entity_type          TEXT NOT NULL,               -- 'Sample' | 'SequencingSample' | 'SampleBatch' | 'SampleResult' | 'Task' | ...
     entity_id            UUID NOT NULL,
@@ -58,10 +65,16 @@ CREATE TABLE events (
 -- "history of one entity"               -> entity_type + entity_id
 -- "what happened next after X"          -> causation_type + causation_id
 -- "outbox poller's hot path"            -> unpublished rows only
+-- "one handler's channel-scoped poll"   -> channel + event_type + occurred_at
 CREATE INDEX idx_events_correlation_id  ON events (correlation_id);
 CREATE INDEX idx_events_entity          ON events (entity_type, entity_id);
 CREATE INDEX idx_events_causation       ON events (causation_type, causation_id);
 CREATE INDEX idx_events_type_occurred   ON events (event_type, occurred_at);
+-- The channel-scoped consumer's selection. Kept alongside the line above
+-- rather than replacing it: a handler subscribed to every channel issues the
+-- pre-channel query with no channel predicate, and that index is what keeps
+-- it off a sequential scan.
+CREATE INDEX idx_events_channel_type_occurred ON events (channel, event_type, occurred_at);
 -- Partial: most events have no inbound request behind them.
 CREATE INDEX idx_events_trace          ON events (trace_id) WHERE trace_id IS NOT NULL;
 CREATE INDEX idx_events_unpublished     ON events (published_at) WHERE published_at IS NULL;

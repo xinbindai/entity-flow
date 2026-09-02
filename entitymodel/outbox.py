@@ -37,7 +37,13 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from entitymodel.importing import import_attr
-from entitymodel.models import Entity, EventHandlerCheckpoint, EventHandlerFailure, EventRecord
+from entitymodel.models import (
+    DEFAULT_CHANNEL,
+    Entity,
+    EventHandlerCheckpoint,
+    EventHandlerFailure,
+    EventRecord,
+)
 
 # A handler receives the open session and one event, and does its own writes
 # on that session. It must not commit -- poll_and_dispatch commits the
@@ -71,6 +77,45 @@ class HandlerCancelled(Exception):
     otherwise the whole record of why. replay() runs a cancelled event again,
     which is the way back if the decision was wrong.
     """
+
+
+class _AllChannels:
+    """
+    Type of the ALL_CHANNELS sentinel. A class rather than the bare string
+    "*" so the wildcard never shares a value space with real channel names --
+    a channel that happened to be called "*" would otherwise mean two things,
+    and the one place that ambiguity would surface is a subscription silently
+    consuming everything.
+
+    Deliberately not iterable: `channels=ALL_CHANNELS` and
+    `channels=["a", "b"]` are different kinds of thing, and quietly iterating
+    would turn a misuse into a subscription to nothing.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "ALL_CHANNELS"
+
+    def __iter__(self):
+        raise TypeError(
+            "ALL_CHANNELS is a sentinel, not a list of channels -- pass it on its own"
+        )
+
+
+# Consume every channel, including ones that do not exist yet. Right for
+# audit, archival and metrics; wrong for most business logic, which should
+# name the channels it is responsible for. See section 3.7.
+ALL_CHANNELS = _AllChannels()
+
+# Accepted as an alias so a deployment can name the wildcard in a
+# configuration file, which cannot hold a Python object -- the same reason
+# `handle` accepts a dotted path. It is normalised to the sentinel
+# immediately, and it means "*" is reserved: it cannot also be a channel name.
+ALL_CHANNELS_ALIAS = "*"
+
+Channels = "Sequence[str] | _AllChannels"
+
 
 # Nothing is configured here. A library that calls basicConfig() decides where
 # the whole application's logs go, which is not its call to make.
@@ -128,8 +173,10 @@ DEFAULT_MAX_BACKOFF_SECONDS = 3600.0
 _MAX_ERROR_CHARS = 2000
 
 __all__ = [
+    "ALL_CHANNELS",
     "DEFAULT_BACKOFF_SECONDS",
     "DEFAULT_MAX_ATTEMPTS",
+    "DEFAULT_CHANNEL",
     "DEFAULT_MAX_BACKOFF_SECONDS",
     "Handler",
     "HandlerCancelled",
@@ -149,6 +196,58 @@ __all__ = [
 # "Transaction 1" from the design discussion. Doesn't commit itself, so it
 # composes with whatever else the caller needs in the same transaction.
 # --------------------------------------------------------------------------
+def normalise_channels(channels, *, who: str) -> "tuple[str, ...] | _AllChannels":
+    """
+    Validate a subscription's channels and reduce them to a tuple, or to the
+    ALL_CHANNELS sentinel. `who` names the handler, so a bad value says which
+    subscription it came from.
+
+    A bare string is rejected rather than accepted: `channels="lab-a"` would
+    otherwise iterate into ('l', 'a', 'b', '-', 'a'), subscribing to five
+    channels that do not exist and delivering nothing, with no error anywhere.
+    """
+    if channels is ALL_CHANNELS or isinstance(channels, _AllChannels):
+        return ALL_CHANNELS
+    if isinstance(channels, str):
+        if channels == ALL_CHANNELS_ALIAS:
+            return ALL_CHANNELS
+        raise ValueError(
+            f"{who}: channels must be a sequence, not the string {channels!r} -- "
+            f"a string iterates into one channel per character. "
+            f"Pass [{channels!r}], or ALL_CHANNELS for every channel"
+        )
+    names = tuple(channels)
+    if not names:
+        raise ValueError(
+            f"{who}: subscribes to no channels. Name at least one, or pass "
+            f"ALL_CHANNELS to consume every channel"
+        )
+    for name in names:
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"{who}: {name!r} is not a channel name")
+        if name == ALL_CHANNELS_ALIAS:
+            raise ValueError(
+                f"{who}: {ALL_CHANNELS_ALIAS!r} is reserved for the wildcard -- "
+                f"pass ALL_CHANNELS on its own rather than in a list"
+            )
+    return names
+
+
+def _channel_clause(channels):
+    """
+    The selection predicate for a subscription's channels, or None when it
+    consumes every channel.
+
+    None rather than a tautology on purpose: a handler subscribed to every
+    channel then issues exactly the pre-channel query, which
+    idx_events_type_occurred still covers. Adding `channel = ANY(...)` over
+    every existing channel would push it onto the wider index for no gain.
+    """
+    if channels is ALL_CHANNELS or isinstance(channels, _AllChannels):
+        return None
+    return EventRecord.channel.in_(tuple(channels))
+
+
 def fire_event(
     session: Session,
     entity: Entity,
@@ -158,6 +257,7 @@ def fire_event(
     payload: dict,
     source: str,
     actor_type: str,
+    channel: str = DEFAULT_CHANNEL,
     actor_id: str | None = None,
     causation_type: str | None = None,
     causation_id: uuid.UUID | None = None,
@@ -192,12 +292,20 @@ def fire_event(
     Note it is not inherited automatically. fire_event has no reference to the
     causing event -- only its id -- and looking one up behind the caller's
     back to copy a debugging field would be a poor trade.
+
+    channel is where this event is published (section 3.7), and like trace_id
+    it is not inherited: a handler reacting to an event and emitting its own
+    should pass `channel=ev.channel` if the new event belongs in the same
+    scope, and say so explicitly if it does not. The default keeps the field
+    inert for anyone not using channels, since a subscription that names none
+    consumes this same default.
     """
     entity.status = new_status
     ev = EventRecord(
         event_type=event_type,
         entity_type=entity.category,
         entity_id=entity.id,
+        channel=channel,
         correlation_id=entity.correlation_id or uuid.uuid4(),
         causation_type=causation_type,
         causation_id=causation_id,
@@ -240,15 +348,27 @@ def poll_and_dispatch(
     handler_name: str,
     event_types: list[str],
     handle: Handler,
+    channels: "Sequence[str] | _AllChannels" = (DEFAULT_CHANNEL,),
     batch_size: int = 100,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     backoff_seconds: float = DEFAULT_BACKOFF_SECONDS,
     max_backoff_seconds: float = DEFAULT_MAX_BACKOFF_SECONDS,
 ) -> int:
     """
-    Dispatch up to `batch_size` events of `event_types` that `handler_name`
-    has neither checkpointed nor dead-lettered, and whose retry backoff (if
-    any) has elapsed -- oldest first.
+    Dispatch up to `batch_size` events of `event_types`, in `channels`, that
+    `handler_name` has neither checkpointed nor dead-lettered, and whose retry
+    backoff (if any) has elapsed -- oldest first.
+
+    `channels` defaults to the default channel rather than to every channel,
+    and that is deliberate (section 3.7). Both readings are backward
+    compatible on the day the column lands, since every event is in `default`
+    until somebody says otherwise; they diverge the moment a producer starts
+    stamping a new channel. A wildcard default would silently begin feeding
+    this handler that channel's events, which under tenancy is a leak and
+    gives no signal. Failing closed produces the opposite failure -- the
+    handler stops receiving -- which is loud, and which the empty-poll
+    explanation names outright. Pass ALL_CHANNELS to consume every channel,
+    including ones that do not exist yet.
 
     Returns how many events were settled: handled successfully, or declined by
     the handler raising HandlerCancelled. A handler that raises anything else
@@ -309,13 +429,19 @@ def poll_and_dispatch(
         )
         .exists()
     )
-    pending = session.scalars(
+    channels = normalise_channels(channels, who=f"handler {handler_name!r}")
+    in_channel = _channel_clause(channels)
+
+    query = (
         select(EventRecord)
         .where(EventRecord.event_type.in_(event_types))
         .where(~already_processed)
         .where(~not_yet_eligible)
-        .order_by(EventRecord.occurred_at)
-        .limit(batch_size)
+    )
+    if in_channel is not None:
+        query = query.where(in_channel)
+    pending = session.scalars(
+        query.order_by(EventRecord.occurred_at).limit(batch_size)
     ).all()
 
     # The candidate count is the first thing worth knowing: zero means the
@@ -323,8 +449,8 @@ def poll_and_dispatch(
     # off, or simply no event of these types -- rather than the handler
     # failing.
     log.debug(
-        "%s: polled %s -> %d candidate(s) (batch_size=%d, max_attempts=%d)",
-        handler_name, event_types, len(pending), batch_size, max_attempts,
+        "%s: polled %s on %s -> %d candidate(s) (batch_size=%d, max_attempts=%d)",
+        handler_name, event_types, channels, len(pending), batch_size, max_attempts,
     )
     # "Nothing was dispatched" is the usual complaint, and the reason lives in
     # the anti-joins above, which exclude rows silently. Break the exclusion
@@ -332,7 +458,8 @@ def poll_and_dispatch(
     # a second query.
     if not pending and log.isEnabledFor(logging.DEBUG):
         log.debug("%s: nothing to do because %s", handler_name,
-                  _explain_empty_poll(session, handler_name, event_types, max_attempts))
+                  _explain_empty_poll(session, handler_name, event_types,
+                                      max_attempts, channels))
 
     return _dispatch(
         session, handler_name, pending, handle,
@@ -343,13 +470,24 @@ def poll_and_dispatch(
 
 
 def _explain_empty_poll(
-    session: Session, handler_name: str, event_types: list[str], max_attempts: int
+    session: Session, handler_name: str, event_types: list[str], max_attempts: int,
+    channels=ALL_CHANNELS,
 ) -> str:
     """
-    Why a poll found no candidates: no such events at all, or every one of
-    them already accounted for by this handler. Debug-only, so the extra
-    round trip is paid only by someone who is watching.
+    Why a poll found no candidates: no such events at all, none in the
+    channels this handler subscribes to, or every one of them already
+    accounted for by this handler. Debug-only, so the extra round trips are
+    paid only by someone who is watching.
+
+    The channel case is the reason this function had to learn about channels
+    in the same change that introduced them. Without it, a handler subscribed
+    to 'lab-a' while its producer stamps 'lab_a' is told "no events of type
+    [...] exist yet" -- which is false, and sends the reader to the producer
+    instead of to the typo. A channel that nothing consumes is otherwise
+    indistinguishable from a system with nothing to do.
     """
+    in_channel = _channel_clause(channels)
+
     total = session.scalar(
         select(func.count()).select_from(EventRecord)
         .where(EventRecord.event_type.in_(event_types))
@@ -357,12 +495,39 @@ def _explain_empty_poll(
     if not total:
         return f"no events of type {event_types} exist yet"
 
+    in_scope = total
+    if in_channel is not None:
+        # Counted separately from `total`, and used for the breakdown below:
+        # reporting "of 12 events" while the per-handler numbers only cover
+        # this handler's channels would describe two different populations in
+        # one sentence.
+        in_scope = session.scalar(
+            select(func.count()).select_from(EventRecord)
+            .where(EventRecord.event_type.in_(event_types))
+            .where(in_channel)
+        )
+        if not in_scope:
+            # Name the channels the events are actually in. A typo is only
+            # obvious next to the thing it was meant to be.
+            elsewhere = session.scalars(
+                select(EventRecord.channel)
+                .where(EventRecord.event_type.in_(event_types))
+                .group_by(EventRecord.channel)
+                .order_by(func.count().desc())
+                .limit(10)
+            ).all()
+            return (
+                f"{total} event(s) of type {event_types} exist, but none in "
+                f"channel(s) {list(channels)} -- they are in {list(elsewhere)}"
+            )
+
     processed = session.scalar(
         select(func.count()).select_from(EventHandlerCheckpoint)
         .join(EventRecord, EventRecord.event_id == EventHandlerCheckpoint.event_id)
         .where(
             EventHandlerCheckpoint.handler_name == handler_name,
             EventRecord.event_type.in_(event_types),
+            *( [in_channel] if in_channel is not None else [] ),
         )
     )
     dead, waiting = session.execute(
@@ -378,12 +543,14 @@ def _explain_empty_poll(
         .where(
             EventHandlerFailure.handler_name == handler_name,
             EventRecord.event_type.in_(event_types),
+            *( [in_channel] if in_channel is not None else [] ),
         )
     ).one()
 
+    scope = "" if in_channel is None else f" in channel(s) {list(channels)}"
     return (
-        f"of {total} event(s) of type {event_types}: {processed} already processed, "
-        f"{dead} dead-lettered, {waiting} backing off"
+        f"of {in_scope} event(s) of type {event_types}{scope}: {processed} already "
+        f"processed, {dead} dead-lettered, {waiting} backing off"
     )
 
 
@@ -543,6 +710,7 @@ def _dispatch(
         # session back, which expires `ev`, and the exit line would otherwise
         # pay for a reload just to name the type it already knew.
         event_type = ev.event_type
+        channel = ev.channel
 
         try:
             # INFO, not DEBUG, and the pair below with it. These two lines
@@ -553,8 +721,8 @@ def _dispatch(
             # unattributable exactly when someone needs it. Everything else
             # here stays DEBUG: this is the one pair worth the volume.
             log.info(
-                "%s: dispatching event %s (%s) -- entering handler",
-                handler_name, event_id, event_type,
+                "%s: dispatching event %s (%s on %s) -- entering handler",
+                handler_name, event_id, event_type, ev.channel,
             )
             started = time.monotonic()
             try:
@@ -567,16 +735,16 @@ def _dispatch(
                 # the process died inside the handler, which is a different
                 # thing from it raising, and the next line says which.
                 log.info(
-                    "%s: left handler for event %s (%s) after %.1f ms",
-                    handler_name, event_id, event_type,
+                    "%s: left handler for event %s (%s on %s) after %.1f ms",
+                    handler_name, event_id, event_type, channel,
                     (time.monotonic() - started) * 1000,
                 )
             _settle(session, handler_name, event_id, overwrite=overwrite_checkpoint)
             session.commit()
             succeeded += 1
             log.debug(
-                "%s: event %s (%s) handled and checkpointed",
-                handler_name, event_id, event_type,
+                "%s: event %s (%s on %s) handled and checkpointed",
+                handler_name, event_id, event_type, channel,
             )
         except HandlerCancelled as exc:
             # Not a failure: the handler decided this event is not its
@@ -590,8 +758,8 @@ def _dispatch(
             session.commit()
             settled += 1
             log.info(
-                "%s: event %s (%s) cancelled by the handler -- %s. It will not be retried",
-                handler_name, event_id, event_type, exc or "no reason given",
+                "%s: event %s (%s on %s) cancelled by the handler -- %s. It will not be retried",
+                handler_name, event_id, event_type, channel, exc or "no reason given",
             )
         except Exception as exc:
             # Discard the handler's partial writes. This also leaves any
@@ -599,8 +767,8 @@ def _dispatch(
             # a processed event look unprocessed.
             session.rollback()
             log.debug(
-                "%s: event %s (%s) raised %s: %s",
-                handler_name, event_id, event_type, type(exc).__name__, exc,
+                "%s: event %s (%s on %s) raised %s: %s",
+                handler_name, event_id, event_type, channel, type(exc).__name__, exc,
             )
             if not record_failures:
                 raise
@@ -787,6 +955,12 @@ def replay(
     blocks until that finishes rather than running concurrently with it or
     silently doing nothing.
 
+    Channel is ignored, deliberately. An operator naming specific ids means
+    them, and replay already overrides processed and dead-lettered state on
+    that principle -- filtering those ids by the handler's subscription would
+    make the recovery path silently do nothing in exactly the situation it
+    exists for.
+
     Raises ValueError if any id doesn't exist -- during an incident a typo'd
     UUID should say so, not silently do nothing.
 
@@ -830,6 +1004,10 @@ class Registration:
     "already processed". Changing it is not a rename: the new name has no
     checkpoints, so the handler re-processes the entire event history under
     its new identity. Treat it like a table name, not a variable name.
+
+    That applies with more force to a registration added with
+    channels=ALL_CHANNELS: it has no checkpoints either, so its first run
+    replays the whole history of every channel rather than of one.
     """
 
     name: str
@@ -839,6 +1017,11 @@ class Registration:
     # configuration rather than a direct reference. Kept so a status dump or
     # a log line can say which code a subscription resolved to.
     handle_ref: str | None = None
+    # Which channels this subscription consumes (section 3.7). Defaults to the
+    # default channel, not to every channel: a subscription that names none
+    # must not silently widen the day a producer introduces one. ALL_CHANNELS
+    # is the explicit way to consume everything.
+    channels: "tuple[str, ...] | _AllChannels" = (DEFAULT_CHANNEL,)
     batch_size: int = 100
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
     backoff_seconds: float = DEFAULT_BACKOFF_SECONDS
@@ -871,6 +1054,7 @@ class HandlerRegistry:
         name: str,
         event_types: Sequence[str],
         handle: Handler | str,
+        channels: "Sequence[str] | _AllChannels" = (DEFAULT_CHANNEL,),
         batch_size: int = 100,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         backoff_seconds: float = DEFAULT_BACKOFF_SECONDS,
@@ -889,6 +1073,13 @@ class HandlerRegistry:
         registration, not at first dispatch -- a typo should stop the worker
         starting rather than surface hours later when a matching event finally
         arrives, by which time it looks like an event problem.
+
+        `channels` is validated here for the same reason. It defaults to the
+        default channel; pass ALL_CHANNELS to consume every channel, including
+        ones that do not exist yet -- which is what an audit or archival
+        handler wants and what most business logic does not. The string "*" is
+        accepted as an alias so a configuration file can name the wildcard,
+        and is reserved: it cannot also be a channel.
         """
         if not name:
             raise ValueError("handler name is required -- it is the checkpoint key")
@@ -899,6 +1090,7 @@ class HandlerRegistry:
             )
         if not event_types:
             raise ValueError(f"handler {name!r} subscribes to no event types")
+        channels = normalise_channels(channels, who=f"handler {name!r}")
 
         handle_ref = handle if isinstance(handle, str) else None
         if handle_ref is not None:
@@ -915,6 +1107,7 @@ class HandlerRegistry:
             event_types=tuple(event_types),
             handle=handle,
             handle_ref=handle_ref,
+            channels=channels,
             batch_size=batch_size,
             max_attempts=max_attempts,
             backoff_seconds=backoff_seconds,
@@ -973,6 +1166,7 @@ def dispatch_once(session: Session, registry: HandlerRegistry) -> int:
             handler_name=reg.name,
             event_types=list(reg.event_types),
             handle=reg.handle,
+            channels=reg.channels,
             batch_size=reg.batch_size,
             max_attempts=reg.max_attempts,
             backoff_seconds=reg.backoff_seconds,

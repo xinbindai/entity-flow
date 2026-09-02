@@ -234,6 +234,12 @@ class EntityRelationship(Base):
 # causation_id stays a plain UUID (no FK): it may point at either another
 # event or a task, so it's paired with causation_type instead of one FK.
 # --------------------------------------------------------------------------
+# The channel an event lands in when its producer names none, and the one a
+# subscription consumes when it names none. Both defaults are this value on
+# purpose: it is what makes adding the column inert until somebody uses it.
+DEFAULT_CHANNEL = "default"
+
+
 class EventRecord(Base):
     __tablename__ = "events"
     __table_args__ = (
@@ -241,6 +247,12 @@ class EventRecord(Base):
         Index("idx_events_entity", "entity_type", "entity_id"),
         Index("idx_events_causation", "causation_type", "causation_id"),
         Index("idx_events_type_occurred", "event_type", "occurred_at"),
+        # The channel-scoped consumer's selection (section 3.7). Kept
+        # alongside idx_events_type_occurred rather than replacing it: a
+        # handler subscribed to every channel issues the pre-channel query
+        # with no channel predicate at all, and that index is what keeps it
+        # off a sequential scan.
+        Index("idx_events_channel_type_occurred", "channel", "event_type", "occurred_at"),
         # Partial: most events have no inbound request behind them -- cron
         # jobs, and every event a handler emits without forwarding one. This
         # covers "everything that request caused", which is the only question
@@ -265,6 +277,25 @@ class EventRecord(Base):
     )
     event_type: Mapped[str] = mapped_column(String, nullable=False)
     schema_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+
+    # Where this event was published (section 3.7). Orthogonal to event_type:
+    # one type can be fired into several channels, one channel carries many
+    # types.
+    #
+    # NOT NULL with a default, never nullable: a nullable routing key puts
+    # three-valued logic into the consumer's selection, and `channel = NULL`
+    # is never true, so the failure would be silent under-delivery rather than
+    # an error. server_default as well as default, for the same reason
+    # publish_attempts has one -- a relay or fixture inserting via raw SQL
+    # would otherwise hit a not-null violation.
+    channel: Mapped[str] = mapped_column(
+        String,
+        nullable=False,
+        default=DEFAULT_CHANNEL,
+        # Quoted: text() emits its argument raw, so the bare word would render
+        # as `DEFAULT default` -- a reserved word where a literal belongs.
+        server_default=text(f"'{DEFAULT_CHANNEL}'"),
+    )
 
     entity_type: Mapped[str] = mapped_column(String, nullable=False)
     entity_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("entity.id"), nullable=False)

@@ -30,14 +30,21 @@ def _at(t: str, ms: str, who: str | None) -> str:
     return f"2026-08-23 {t},{ms}" + (f" [{who}]" if who else "")
 
 
-def enter(handler: str, event: str, t: str = "20:00:00", who: str | None = None) -> str:
+def _subject(chan: str | None) -> str:
+    """"(EventType)" on a pre-channel log, "(EventType on chan)" after."""
+    return "AnalysisTaskSucceeded" + (f" on {chan}" if chan else "")
+
+
+def enter(handler: str, event: str, t: str = "20:00:00", who: str | None = None,
+          chan: str | None = None) -> str:
     return (f"{_at(t, '000', who)} DEBUG entitymodel.outbox: {handler}: dispatching "
-            f"event {event} (AnalysisTaskSucceeded) -- entering handler")
+            f"event {event} ({_subject(chan)}) -- entering handler")
 
 
-def leave(handler: str, event: str, t: str = "20:00:01", who: str | None = None) -> str:
+def leave(handler: str, event: str, t: str = "20:00:01", who: str | None = None,
+          chan: str | None = None) -> str:
     return (f"{_at(t, '000', who)} DEBUG entitymodel.outbox: {handler}: left handler "
-            f"for event {event} (AnalysisTaskSucceeded) after 12.3 ms")
+            f"for event {event} ({_subject(chan)}) after 12.3 ms")
 
 
 def done(handler: str, event: str, t: str = "20:00:02", who: str | None = None) -> str:
@@ -334,6 +341,63 @@ def test_a_format_without_a_process_id_still_works(tmpdir: Path) -> None:
 
 
 
+# --------------------------------------------------------------------------
+# Channels (section 3.7). The outbox lines carry "(EventType on channel)";
+# the handler's own lines carry neither, so filtering by channel has to reach
+# them through the run they sit in.
+# --------------------------------------------------------------------------
+def test_the_channel_is_parsed_off_the_line(tmpdir: Path) -> None:
+    log = write(tmpdir, "a.log",
+                enter("create-result", E1, chan="lab-a"),
+                leave("create-result", E1, chan="lab-a"))
+
+    found = search_logs(log)
+
+    assert {line.channel for line in found} == {"lab-a"}, [l.channel for l in found]
+    assert all(line.event_type == "AnalysisTaskSucceeded" for line in found), \
+        "the event type must survive the channel being appended to it"
+
+
+def test_filtering_by_channel_keeps_the_handlers_own_lines(tmpdir: Path) -> None:
+    """They carry no channel, so they inherit the run's."""
+    log = write(tmpdir, "a.log",
+                enter("create-result", E1, "20:00:00", chan="lab-a"),
+                app("mine", "20:00:01"),
+                leave("create-result", E1, "20:00:02", chan="lab-a"))
+
+    found = texts(search_logs(log, channel="lab-a"))
+
+    assert any("mine" in t for t in found), found
+
+
+def test_filtering_by_channel_excludes_other_channels(tmpdir: Path) -> None:
+    log = write(tmpdir, "a.log",
+                enter("audit", E1, "20:00:00", chan="lab-a"),
+                app("lab-a work", "20:00:01"),
+                leave("audit", E1, "20:00:02", chan="lab-a"),
+                enter("audit", E2, "20:00:03", chan="lab-b"),
+                app("lab-b work", "20:00:04"),
+                leave("audit", E2, "20:00:05", chan="lab-b"))
+
+    found = texts(search_logs(log, handler_name="audit", channel="lab-a"))
+
+    assert any("lab-a work" in t for t in found), found
+    assert not any("lab-b work" in t for t in found), \
+        "a cross-channel handler's runs must still be separable by channel"
+
+
+def test_a_pre_channel_log_still_parses(tmpdir: Path) -> None:
+    """Old files are exactly what this gets pointed at."""
+    log = write(tmpdir, "a.log",
+                enter("create-result", E1), app("still found"), leave("create-result", E1))
+
+    found = search_logs(log, handler_name="create-result")
+
+    assert any("still found" in t for t in texts(found)), texts(found)
+    assert all(line.channel is None for line in found if line.role != "handler")
+
+
+
 TESTS = [
     test_it_returns_the_outbox_lines_for_one_handler,
     test_it_includes_the_lines_the_handler_wrote,
@@ -356,6 +420,10 @@ TESTS = [
     test_threads_of_one_process_are_kept_apart,
     test_a_bracketed_number_in_a_message_is_not_a_process_id,
     test_a_format_without_a_process_id_still_works,
+    test_the_channel_is_parsed_off_the_line,
+    test_filtering_by_channel_keeps_the_handlers_own_lines,
+    test_filtering_by_channel_excludes_other_channels,
+    test_a_pre_channel_log_still_parses,
 ]
 
 

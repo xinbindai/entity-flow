@@ -84,18 +84,25 @@ _ORIGIN = re.compile(rf"^{_TS}\s+\[(?P<process>\d+)(?::(?P<thread>\d+))?\]")
 # The three shapes an outbox line takes. Anchored on the message rather than
 # on the whole line, because the prefix in front of it is the application's
 # format string and this module has no business assuming one.
+# "(EventType on channel)". The channel half is optional so a log written
+# before channels existed still parses -- an old file is exactly the sort of
+# thing this gets pointed at.
+_SUBJECT = r"\((?P<type>[^)]*?)(?: on (?P<channel>[^)]*))?\)"
+
 _ENTER = re.compile(
     rf"(?P<handler>[\w.\-]+): dispatching event (?P<event>{_UUID}) "
-    rf"\((?P<type>[^)]*)\) -- entering handler"
+    rf"{_SUBJECT} -- entering handler"
 )
 _LEAVE = re.compile(
     rf"(?P<handler>[\w.\-]+): left handler for event (?P<event>{_UUID}) "
-    rf"\((?P<type>[^)]*)\) after"
+    rf"{_SUBJECT} after"
 )
 # Everything else outbox says about a specific event: handled and
-# checkpointed, raised, cancelled, skipping.
+# checkpointed, raised, cancelled, skipping. The subject is optional here
+# because the skip lines carry only the id.
 _OTHER = re.compile(
     rf"(?P<handler>[\w.\-]+): (?:event|skipping event) (?P<event>{_UUID})"
+    rf"(?: {_SUBJECT})?"
 )
 
 
@@ -112,6 +119,7 @@ class Line:
     handler_name: str | None    # None on a line the handler itself wrote
     event_id: str | None
     event_type: str | None
+    channel: str | None  # None on a handler's own line, and on pre-channel logs
     role: str            # "enter" | "leave" | "outbox" | "handler"
     ambiguous: bool      # attributed by position while >1 run was open here
 
@@ -140,14 +148,14 @@ def _parse_origin(text: str) -> tuple[int | None, int | None]:
     return int(m.group("process")), int(thread) if thread else None
 
 
-def _classify(text: str) -> tuple[str, str | None, str | None, str | None]:
-    """(role, handler_name, event_id, event_type) for one line."""
+def _classify(text: str) -> tuple[str, str | None, str | None, str | None, str | None]:
+    """(role, handler_name, event_id, event_type, channel) for one line."""
     for role, pattern in (("enter", _ENTER), ("leave", _LEAVE), ("outbox", _OTHER)):
         m = pattern.search(text)
         if m:
-            groups = m.groupdict()
-            return role, groups["handler"], groups["event"], groups.get("type")
-    return "handler", None, None, None
+            g = m.groupdict()
+            return role, g["handler"], g["event"], g.get("type"), g.get("channel")
+    return "handler", None, None, None, None
 
 
 def _read(path: Path) -> list[tuple[int, str, datetime | None, tuple[int | None, int | None]]]:
@@ -176,6 +184,7 @@ def search_logs(
     *paths: str | Path,
     handler_name: str | None = None,
     event_id: str | None = None,
+    channel: str | None = None,
     include_handler_lines: bool = True,
 ) -> list[Line]:
     """
@@ -216,11 +225,15 @@ def search_logs(
         open_runs: dict[tuple[int | None, int | None], dict[tuple[str, str], None]] = {}
         last_ts: datetime | None = None
         pending: list[tuple[Line, list[tuple[str, str]]]] = []
+        # A run's channel, learned from its outbox lines, so filtering by
+        # channel keeps the handler's own lines -- they carry no channel of
+        # their own, exactly as they carry no handler name.
+        run_channel: dict[tuple[str, str], str] = {}
 
         for lineno, text, ts, origin in _read(path):
             if ts is not None:
                 last_ts = ts
-            role, handler, event, event_type = _classify(text)
+            role, handler, event, event_type, ev_channel = _classify(text)
             process, thread = origin
 
             if role == "enter":
@@ -237,7 +250,7 @@ def search_logs(
                 line = Line(
                     path=str(path), lineno=lineno, text=text,
                     timestamp=ts or last_ts, process=process, thread=thread,
-                    handler_name=None, event_id=None, event_type=None,
+                    handler_name=None, event_id=None, event_type=None, channel=None,
                     role=role, ambiguous=ambiguous,
                 )
                 pending.append((line, owners))
@@ -246,9 +259,11 @@ def search_logs(
                     path=str(path), lineno=lineno, text=text,
                     timestamp=ts or last_ts, process=process, thread=thread,
                     handler_name=handler, event_id=event, event_type=event_type,
-                    role=role, ambiguous=False,
+                    channel=ev_channel, role=role, ambiguous=False,
                 )
                 pending.append((line, [(handler, event.lower())]))
+                if ev_channel:
+                    run_channel[(handler, event.lower())] = ev_channel
 
         for line, owners in pending:
             if not owners:
@@ -256,6 +271,10 @@ def search_logs(
             if handler_name is not None and not any(h == handler_name for h, _ in owners):
                 continue
             if wanted_event is not None and not any(e == wanted_event for _, e in owners):
+                continue
+            if channel is not None and not any(
+                run_channel.get(owner) == channel for owner in owners
+            ):
                 continue
             if not include_handler_lines and line.role == "handler":
                 continue
@@ -282,6 +301,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("paths", nargs="+", help="log files to read")
     parser.add_argument("--handler", default=None, help="handler_name to filter on")
     parser.add_argument("--event", default=None, help="event_id to filter on")
+    parser.add_argument("--channel", default=None, help="channel to filter on")
     parser.add_argument(
         "--no-handler-lines", action="store_true",
         help="only the lines entitymodel.outbox wrote",
@@ -296,6 +316,7 @@ def main(argv: list[str] | None = None) -> int:
             *args.paths,
             handler_name=args.handler,
             event_id=args.event,
+            channel=args.channel,
             include_handler_lines=not args.no_handler_lines,
         )
     except (FileNotFoundError, ValueError) as exc:

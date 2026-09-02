@@ -187,6 +187,91 @@ A handler reacting to a domain event by deciding "go do real work" typically bri
 
 It's also possible to use the durable events table itself as a self-defined bus — each handler (or a shared dispatcher) polls `SELECT ... WHERE event_type = ANY(...) AND NOT EXISTS (checkpoint for this handler)`, which is genuine per-handler fan-out at the database level, no broker required. Reasonable at moderate volume and when handlers live in the same service; a real broker is worth adding once handlers live in separate services and shouldn't be polling the core operational database directly.
 
+### 3.7 Channels: scoping which handlers see which events
+
+`event_type` says *what happened*. `channel` says *where it was published* — a routing scope
+stamped on the event at fire time and never changed afterwards. The two are orthogonal: one
+type can be fired into several channels (the same `SampleReceived` for two labs), and one
+channel carries many types.
+
+It is an envelope field, not payload, for the reason §3.1 gives — routing and provenance
+belong somewhere every event type has them, and a key buried in `payload` JSONB cannot back
+an index, which is what the consumer's selection needs it to do. It is also not `source`,
+which names the producing service, and deliberately not an `event_type` prefix
+(`lab-a.SampleReceived`), which would multiply the catalog and make "every SampleReceived"
+unanswerable.
+
+**Schema.** `channel TEXT NOT NULL DEFAULT 'default'`, plus
+`idx_events_channel_type_occurred (channel, event_type, occurred_at)`. NOT NULL rather than
+nullable because a nullable routing key puts three-valued logic in the selection predicate,
+and `channel = NULL` is never true — the failure would be silent under-delivery. The server
+default matters as well as the Python one, so a relay or fixture inserting by raw SQL cannot
+hit a not-null violation. On PostgreSQL 11+ adding a NOT NULL column *with* a default is
+metadata-only, so this does not rewrite the events table.
+
+`idx_events_type_occurred` is kept rather than replaced. A handler consuming every channel
+issues exactly the pre-channel query, and without that index it would fall back to a scan —
+see the wildcard below, which is what makes that index load-bearing rather than legacy.
+
+**The matching rule.** A subscription naming no channel means `['default']`, *not* every
+channel. Both readings are backward compatible on the day the column lands, since every
+existing row backfills to `default`; they diverge the moment anyone fires into a new channel.
+A wildcard default would silently start feeding existing handlers the new channel's events,
+which under tenancy is a cross-tenant leak and gives no signal. Fail-closed produces the
+opposite failure — a handler stops receiving — which is loud, and which §5.3's empty-poll
+diagnostic now names outright. The asymmetry decides it. This also matches the rule
+`register()` already enforces for `event_types`, where subscribing to none is an error rather
+than a subscription to all.
+
+**Consuming every channel.** Some handlers genuinely need the cross-channel view — audit,
+archival, metrics — while others must stay scoped, and both subscribe to the same event type:
+
+```python
+@registry.on("SampleReceived", name="audit-trail",      channels=ALL_CHANNELS)
+@registry.on("SampleReceived", name="lab-a-accession",  channels=["lab-a"])
+```
+
+They coexist because idempotency is keyed `(handler_name, event_id)` and channel is a
+selection predicate, never part of identity: one event gets one checkpoint row per handler,
+and neither can see the other's progress. Adding `channel` to that key would widen it with a
+column that can only agree with `event_id` or be wrong.
+
+`ALL_CHANNELS` is a sentinel object rather than the string `"*"`, so the wildcard never shares
+a value space with real channel names — a channel that happened to be called `*` would
+otherwise mean two things. It carries two consequences worth stating rather than discovering:
+it includes channels that **do not exist yet**, so a tenant onboarded next year is consumed
+automatically (right for audit, wrong for most business logic); and a wildcard handler added
+later has no checkpoints, so its first run replays the entire history of every channel, which
+is the ordinary new-handler behaviour with a much larger blast radius.
+
+**The fifth reason a poll finds nothing.** §5.3's diagnostic explains a silent poll as one of
+four exclusions. Channels add a fifth — events of the right type exist, but in channels this
+handler does not subscribe to. Without it a `lab-a` subscriber facing a producer that stamps
+`lab_a` is told *"no events of type [SampleReceived] exist yet"*, which is false and points at
+the producer rather than at the typo. The diagnostic learns about channels in the same change
+that introduces them, because a channel typo is otherwise indistinguishable from a working
+system.
+
+**Replay ignores channel.** `replay()` takes explicit event ids from an operator, and already
+overrides processed and dead-lettered state on the principle that naming an id means it.
+Filtering those ids by subscription would make the recovery path silently do nothing in
+exactly the situation it exists for.
+
+**Deferred: validating channel names.** A typo creates a channel nothing consumes, and the
+taxonomy pattern of §2.4 is the established answer — an `event_channel` lookup table with a
+foreign key, seeded from CSV, so adding a channel is a data change and a typo fails at insert.
+It is deferred rather than rejected: the column, the matching and the diagnostic are
+independent of whether the values are constrained, so it can land later without rework. Until
+then the empty-poll explanation is what catches a typo, one poll later instead of at insert.
+
+**Considered and rejected.** A table or schema per channel — loses the single log, and with it
+the enforced `events.entity_id -> entity.id` foreign key that §2.4 gives as the reason the
+unified entity table was chosen. An array column so one event can be in several channels —
+wrecks the index, and makes "where was this published" ambiguous when the whole point is that
+it is one immutable fact; one event reaching several handlers is what per-handler fan-out
+already does.
+
+
 ## 4. Task model
 
 ### 4.1 Task schema and types
@@ -322,6 +407,7 @@ This design was carried through to working code, produced alongside this documen
 | `test/test_taxonomy_sync.py` | Reconciliation tests (§2.4), starting from an *empty* taxonomy since driving the sync is the point: seeding, idempotency, additions, description and `is_terminal` updates, removals reported rather than applied, deletion refused while a type or status is in use, dry run writing nothing, CSV validation, and this project's own CSVs loading |
 | `test/test_celery_tasks.py` | Submission and lifecycle tests (§4.2): the row committed before the message is sent, a failed send leaving a recoverable Task, correlation and causation propagated, the `Queued → Running → Succeeded` walk, a failing body marked Failed with its partial writes rolled back, `Retrying` set only when Celery will genuinely retry rather than merely having budget left, and payload-file validation. Eager mode covers the body; a recording double covers the send |
 | `test/test_celery_workers.py` | Fleet process-management tests: pid files written and honoured, a second start skipping running workers and `force` restarting them, stop terminating what the pid files point at, stale and garbage pid files discarded rather than wedging the fleet, log directories created, SIGTERM stopping the workers it started, and workers not inheriting the parent's stdout. Pointed at a stub command, so no broker and no real workers are involved |
+| `test/test_channels.py` | Channel tests (§3.7): an event defaulting to `default` and landing in a named channel, a scoped handler seeing only its own, several channels named at once, `ALL_CHANNELS` covering every channel including ones invented later, a scoped and a cross-channel handler sharing one event type without disturbing each other's checkpoints, the validation that rejects a bare string and reserves `"*"`, the empty-poll explanation naming a channel typo next to the channel the events are really in, and `replay()` ignoring channel |
 | `test/test_log_search.py` | Log-filtering tests: a handler's own lines recovered from between the brackets, two handlers on one event kept apart, lines outside every run excluded, a traceback staying attached to the record that raised it, files merged in time order, a run not spanning two files, and interleaved runs flagged ambiguous rather than guessed at |
 | `test/test_importing.py` | Dotted-path tests: both spellings, nested modules and non-callables — and, the point of the suite, each failure raising the error that sends the reader to the right file, including an `AttributeError` raised *during* import not being disguised as a missing attribute |
 

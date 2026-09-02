@@ -8,7 +8,8 @@ first, then sends the message:
     task = submit_task(session, celery_app,
                        celery_task_name="myapp.run_pipeline",
                        subcategory="bioinformatics_pipeline_analysis",
-                       name="run-2026-08-02", payload={"sample": "SEQ-001"})
+                       name="run-2026-08-02", payload={"sample": "SEQ-001"},
+                       channel="lab-a")
 
 and the worker side wraps the body so the row follows the execution:
 
@@ -52,7 +53,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from entitymodel.importing import import_attr
-from entitymodel.models import Task
+from entitymodel.models import DEFAULT_CHANNEL, Task
 from entitymodel.outbox import fire_event
 
 __all__ = [
@@ -110,6 +111,7 @@ def submit_task(
     subcategory: str,
     name: str,
     payload: dict,
+    channel: str = DEFAULT_CHANNEL,
     queue: str | None = None,
     source: str = "cli",
     actor_type: str = "user",
@@ -138,7 +140,17 @@ def submit_task(
         # can carry it into TaskStarted/Succeeded/Failed without a lookup. The
         # worker runs in a different process minutes later; the alternative is
         # a query per transition to find the event that queued it.
-        attributes={"payload": payload, "retry_count": 0, "trace_id": trace_id},
+        # channel is kept on the Task for the same reason trace_id is: the
+        # worker runs in another process minutes later and has to stamp
+        # TaskStarted/Succeeded/Failed into the same channel the submission
+        # went to. The alternative is a query per transition to find the event
+        # that queued it.
+        attributes={
+            "payload": payload,
+            "retry_count": 0,
+            "trace_id": trace_id,
+            "channel": channel,
+        },
     )
     session.add(task)
     session.flush()  # need task.id before the event can reference it
@@ -149,6 +161,7 @@ def submit_task(
         event_type=event_type,
         new_status=statuses.queued,
         payload={"celery_task_name": celery_task_name, "queue": queue},
+        channel=channel,
         source=source,
         actor_type=actor_type,
         actor_id=actor_id,
@@ -302,6 +315,9 @@ def _transition(
         payload=payload,
         source="celery-worker",
         actor_type="worker",
+        # Carried from submission, so a task's whole lifecycle lands in the
+        # channel that asked for it rather than leaking into the default.
+        channel=task.attributes.get("channel", DEFAULT_CHANNEL),
         # Carried from submission, so the whole execution lines up against the
         # request that asked for it.
         trace_id=task.attributes.get("trace_id"),
@@ -325,6 +341,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--name", required=True, help="name for the Task entity")
     parser.add_argument("--payload", required=True, help="path to a JSON payload file")
     parser.add_argument("--queue", default=None, help="queue to route to")
+    parser.add_argument(
+        "--channel", default=DEFAULT_CHANNEL,
+        help="channel to publish this task's events into",
+    )
     parser.add_argument("--source", default="cli")
     parser.add_argument("--actor-type", default="user")
     parser.add_argument("--actor-id", default=None)
@@ -347,6 +367,7 @@ def main(argv: list[str] | None = None) -> int:
             subcategory=args.subcategory,
             name=args.name,
             payload=payload,
+            channel=args.channel,
             queue=args.queue,
             source=args.source,
             actor_type=args.actor_type,
