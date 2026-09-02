@@ -482,6 +482,100 @@ command.upgrade(make_config(db_url), "head")
 > `--db-url` is passed to Alembic as an attribute rather than as `sqlalchemy.url`, so a
 > password containing `%` survives — main options go through ConfigParser interpolation.
 
+### From an application that depends on this package
+
+Split it in two: **a deploy job migrates, and the application only checks.** With more than
+one replica, migrating at boot means every replica races to do it — and the index migrations
+here use `CREATE INDEX CONCURRENTLY`, which cannot run in a transaction and so is not
+protected by one.
+
+```python
+# myapp/schema.py
+from alembic import command
+from alembic.runtime.migration import MigrationContext
+from alembic.script import ScriptDirectory
+from sqlalchemy import Engine
+
+from entitymodel.migrate import make_config
+
+
+class SchemaOutOfDate(RuntimeError):
+    """The database is behind the code trying to use it."""
+
+
+def revisions(engine: Engine) -> tuple[str | None, str | None]:
+    """(what the database is at, what this build expects)."""
+    script = ScriptDirectory.from_config(make_config())
+    head = script.get_current_head()
+    with engine.connect() as conn:
+        current = MigrationContext.configure(conn).get_current_revision()
+    return current, head
+
+
+def upgrade_to_head(db_url: str) -> None:
+    """Run by the deploy job. One process, not every replica."""
+    command.upgrade(make_config(db_url), "head")
+
+
+def require_up_to_date(engine: Engine) -> None:
+    """Run at startup. Never migrates -- refuses to start."""
+    current, head = revisions(engine)
+    if current != head:
+        raise SchemaOutOfDate(
+            f"database is at {current or 'nothing (empty)'}, this build needs {head}. "
+            f"Run: python -m entitymodel.migrate upgrade head --db-url ..."
+        )
+```
+
+`make_config()` takes no URL for the two read-only calls — it is only needed to locate the
+packaged revisions. `ScriptDirectory` reads files, and `MigrationContext` uses your own engine.
+
+The application calls the check and nothing else:
+
+```python
+def boot(db_url: str) -> int:
+    engine = create_engine(db_url)
+    try:
+        require_up_to_date(engine)
+    except SchemaOutOfDate as exc:
+        log.error("refusing to start: %s", exc)
+        return 1
+    ...
+```
+
+```console
+$ python -m myapp                     # against an empty database
+refusing to start: database is at nothing (empty), this build needs 9c4e1a7b2d05.
+Run: python -m entitymodel.migrate upgrade head --db-url ...
+
+$ entity-flow-migrate upgrade head --db-url ...
+$ python -m myapp
+started; schema at 9c4e1a7b2d05 (head)
+```
+
+Failing at startup is the point. The alternative is booting onto a stale schema and finding
+out later, as a handler that looks broken because a column it selects does not exist yet —
+which reads as an application bug rather than a deployment one.
+
+In a container setup the deploy half needs no Python wrapper at all:
+
+```yaml
+initContainers:
+  - name: migrate
+    command: ["entity-flow-migrate", "upgrade", "head", "--db-url", "$(DATABASE_URL)"]
+containers:
+  - name: app          # calls require_up_to_date() at startup
+```
+
+If your team applies schema changes through review instead, `--sql` prints them:
+
+```bash
+entity-flow-migrate upgrade 27f88ce75b7b:head --sql --db-url ... > migration.sql
+```
+
+Give it a range. With `--sql` and no range Alembic emits from *base*, because offline mode
+cannot know what revision the database is currently at.
+
 ### From a checkout
 
 The Alembic CLI works as before, reading `POSTGRES_URL` from the environment or `.env`:
